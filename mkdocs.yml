@@ -365,6 +365,8 @@ nav:
                   - LDAP: "user-guide/administration/configuration/authentication/ldap.md"
                   - SSO: "user-guide/administration/configuration/authentication/sso.md"
                   - Remote Header: "user-guide/administration/configuration/authentication/remote.md"
+              - OpenTelemetry: "user-guide/administration/configuration/opentelemetry.md"
+
           - Tools:
               - Nautobot Server: "user-guide/administration/tools/nautobot-server.md"
               - Nautobot Shell: "user-guide/administration/tools/nautobot-shell.md"
