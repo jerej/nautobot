@@ -1,8 +1,11 @@
 """Tests for OpenTelemetry instrumentation in Nautobot."""
 
+import json
 from unittest.mock import MagicMock, patch
 
 import requests
+import structlog
+from django.test import RequestFactory
 from opentelemetry import trace
 from opentelemetry.instrumentation.requests import RequestsInstrumentor
 from opentelemetry.propagate import get_global_textmap, set_global_textmap
@@ -11,6 +14,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
+from nautobot.core.middleware import GraphQLOpenTelemetryMiddleware
 from nautobot.core.testing import TestCase
 
 
@@ -95,3 +99,83 @@ class RequestsInstrumentationTraceparentTest(TestCase):
             16,
             f"traceparent parent-id should be 16 lowercase hex chars, got: {parts[2]!r}",
         )
+
+
+class GraphQLOpenTelemetryMiddlewareTest(TestCase):
+    """Verify GraphQLOpenTelemetryMiddleware emits correct OTel spans and structured log entries."""
+
+    _SAMPLE_QUERY = "query GetSites { sites { id name } }"
+    _SAMPLE_VARIABLES = {"limit": 10}
+
+    def setUp(self):
+        super().setUp()
+        self._exporter = InMemorySpanExporter()
+        self._provider = TracerProvider()
+        self._provider.add_span_processor(SimpleSpanProcessor(self._exporter))
+        self._original_provider = trace.get_tracer_provider()
+        trace.set_tracer_provider(self._provider)
+
+    def tearDown(self):
+        trace.set_tracer_provider(self._original_provider)
+        super().tearDown()
+
+    def _make_middleware(self, status_code=200):
+        mock_response = MagicMock()
+        mock_response.status_code = status_code
+        return GraphQLOpenTelemetryMiddleware(MagicMock(return_value=mock_response))
+
+    def _build_request(self, path="/api/graphql", query=None, variables=None, xff="203.0.113.5, 10.0.0.1"):
+        """Return a POST WSGIRequest pre-populated with a JSON GraphQL body."""
+        if query is None:
+            query = self._SAMPLE_QUERY
+        body = {"query": query}
+        if variables is not None:
+            body["variables"] = variables
+        request = RequestFactory().post(path, data=json.dumps(body), content_type="application/json")
+        request.user = self.user
+        if xff:
+            request.META["HTTP_X_FORWARDED_FOR"] = xff
+        return request
+
+    def test_span_created_with_correct_attributes(self):
+        """A GraphQL request must produce a span named after the operation type with all expected attributes."""
+        middleware = self._make_middleware(status_code=200)
+        request = self._build_request(variables=self._SAMPLE_VARIABLES, xff="203.0.113.5, 10.0.0.1")
+
+        middleware(request)
+
+        spans = self._exporter.get_finished_spans()
+        self.assertEqual(len(spans), 1, "Expected exactly one span to be emitted for a GraphQL request.")
+        span = spans[0]
+
+        self.assertEqual(span.name, "graphql query")
+
+        attrs = span.attributes
+        self.assertEqual(attrs.get("enduser.id"), self.user.username)
+        self.assertEqual(attrs.get("http.client_ip"), "203.0.113.5", "Should use the leftmost X-Forwarded-For entry.")
+        self.assertEqual(attrs.get("graphql.document"), self._SAMPLE_QUERY)
+        self.assertEqual(attrs.get("graphql.variables"), json.dumps(self._SAMPLE_VARIABLES))
+        self.assertEqual(attrs.get("graphql.operation.type"), "query")
+        self.assertEqual(attrs.get("http.status_code"), 200)
+
+    def test_log_emitted_with_correct_fields(self):
+        """The INFO log for a GraphQL request must include username, IP, query, variables, status, and duration."""
+        middleware = self._make_middleware(status_code=200)
+        request = self._build_request(variables=self._SAMPLE_VARIABLES, xff="203.0.113.5")
+
+        with structlog.testing.capture_logs() as captured:
+            middleware(request)
+
+        graphql_logs = [e for e in captured if e.get("event") == "graphql.request"]
+        self.assertEqual(len(graphql_logs), 1, f"Expected exactly one graphql.request log entry; got: {captured!r}")
+        log = graphql_logs[0]
+
+        self.assertEqual(log.get("log_level"), "info")
+        self.assertEqual(log.get("username"), self.user.username)
+        self.assertEqual(log.get("client_ip"), "203.0.113.5")
+        self.assertEqual(log.get("query"), self._SAMPLE_QUERY)
+        self.assertEqual(log.get("variables"), self._SAMPLE_VARIABLES)
+        self.assertEqual(log.get("http_status"), 200)
+        self.assertIn("duration_ms", log, "duration_ms must be present in the log entry.")
+        self.assertIsInstance(log["duration_ms"], float)
+        self.assertGreaterEqual(log["duration_ms"], 0.0)
