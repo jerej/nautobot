@@ -157,6 +157,7 @@ opentelemetry-instrumentation-redis = "^0.60b1"
 opentelemetry-instrumentation-logging = "^0.60b1"
 opentelemetry-instrumentation-mysqlclient = "^0.60b1"
 opentelemetry-instrumentation-wsgi = "^0.60b1"
+opentelemetry-instrumentation-requests = "^0.60b1"
 
 [tool.poetry.extras]
 all = ["django-auth-ldap", "django-storages", "mysqlclient", "napalm", "social-auth-core"]

@@ -1543,7 +1543,7 @@ properties:
     environment_variable: "NAUTOBOT_NTC_SUPPORT_CONTRACT_EXPIRATION_DATE"
     is_constance_config: true
     version_added: "2.4.0"
-OTEL_EXPORTER_OTLP_ENDPOINT:
+  OTEL_EXPORTER_OTLP_ENDPOINT:
     type: string
     format: uri
     default: ''
@@ -1569,7 +1569,7 @@ OTEL_EXPORTER_OTLP_ENDPOINT:
     default:
     - otlp
     description: Set how to export OpenTelemetry metrics.
-OTEL_PYTHON_DJANGO_INSTRUMENT:
+  OTEL_PYTHON_DJANGO_INSTRUMENT:
     type: boolean
     default: false
     description: Setting this to true enables OpenTelemetry Metrics including propagating the Traceparent header in API requests.

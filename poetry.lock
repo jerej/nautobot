@@ -3329,6 +3329,27 @@ wrapt = ">=1.12.1"
 instruments = ["redis (>=2.6)"]
 
 [[package]]
+name = "opentelemetry-instrumentation-requests"
+version = "0.60b1"
+description = "OpenTelemetry requests instrumentation"
+optional = false
+python-versions = ">=3.9"
+groups = ["main"]
+files = [
+    {file = "opentelemetry_instrumentation_requests-0.60b1-py3-none-any.whl", hash = "sha256:eec9fac3fab84737f663a2e08b12cb095b4bd67643b24587a8ecfa3cf4d0ca4c"},
+    {file = "opentelemetry_instrumentation_requests-0.60b1.tar.gz", hash = "sha256:9a1063c16c44a3ba6e81870c4fa42a0fac3ecef5a4d60a11d0976eec9046f3d4"},
+]
+
+[package.dependencies]
+opentelemetry-api = ">=1.12,<2.0"
+opentelemetry-instrumentation = "0.60b1"
+opentelemetry-semantic-conventions = "0.60b1"
+opentelemetry-util-http = "0.60b1"
+
+[package.extras]
+instruments = ["requests (>=2.0,<3.0)"]
+
+[[package]]
 name = "opentelemetry-instrumentation-wsgi"
 version = "0.60b1"
 description = "WSGI Middleware for OpenTelemetry"
@@ -6129,4 +6150,4 @@ sso = ["social-auth-core"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "043434ac47c470284f63c3ed4edbd4cc9486122ffbe5134e908b6a65ce1fac6a"
+content-hash = "82c00114bc36a16c751521f85ffaac84154fd159b833d32da28719aaa863b671"
