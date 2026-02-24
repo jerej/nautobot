@@ -1566,9 +1566,10 @@ properties:
       enum:
       - otlp
       - console
+      - none
     default:
     - otlp
-    description: Set how to export OpenTelemetry metrics.
+    description: Set how to export OpenTelemetry metrics in comma-separated format.
   OTEL_PYTHON_DJANGO_INSTRUMENT:
     type: boolean
     default: false
@@ -1585,9 +1586,10 @@ properties:
       enum:
       - otlp
       - console
+      - none
     default:
     - otlp
-    description: Set how to export OpenTelemetry traces.
+    description: Set how to export OpenTelemetry traces in comma-separated format.
   PAGINATE_COUNT:
     default: 50
     description: >-

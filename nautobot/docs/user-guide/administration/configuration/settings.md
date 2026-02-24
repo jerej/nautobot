@@ -15,6 +15,7 @@ A number of settings can alternatively be configured via the Nautobot Admin UI. 
 <!-- pyml disable-num-lines 5 blanks-around-lists -->
 {% for property, attrs in settings_schema.properties.items() %}
 {% if attrs.is_constance_config|default(false) %}
+
 * [`{{ property }}`](#{{ property|lower }})
 {% endif %}
 {% endfor %}
@@ -73,6 +74,7 @@ can specify additional apps with ease.  Similarly, additional `MIDDLEWARE` can b
 **Permitted Values:**
 
 {% for enum in attrs.enum %}
+
 * `{{ enum|pprint }}`
 {% endfor %}
 {% endif %}
@@ -83,6 +85,7 @@ can specify additional apps with ease.  Similarly, additional `MIDDLEWARE` can b
 **Environment Variables:**
 
 {% for environment_variable in attrs.environment_variables %}
+
 * `{{ environment_variable }}`
 {% endfor %}
 {% elif attrs.properties|default(None) != None and attrs.properties.default|default(None) != None %}
@@ -92,6 +95,7 @@ can specify additional apps with ease.  Similarly, additional `MIDDLEWARE` can b
 
 {% endif %}
 {% if property_attrs.environment_variable|default(None) %}
+
 * `{{ property_attrs.environment_variable }}`
 {% else %}
 {% for environment_variable in property_attrs.environment_variables %}
@@ -106,6 +110,7 @@ can specify additional apps with ease.  Similarly, additional `MIDDLEWARE` can b
 
 {% endif %}
 {% if property_attrs.environment_variable|default(None) %}
+
 * `{{ property_attrs.environment_variable }}`
 {% else %}
 {% for environment_variable in property_attrs.environment_variables %}
@@ -128,6 +133,7 @@ can specify additional apps with ease.  Similarly, additional `MIDDLEWARE` can b
 **See Also:**
 
 {% for text, url in attrs.see_also.items() %}
+
 * [ {{ text }} ]({{ url }})
 {% endfor %}
 {% endif %}
@@ -218,7 +224,7 @@ Default: `console`
 
 Environment Variable: `OTEL_METRICS_EXPORTER`
 
-Set where to export metrics to. Only a subset of the OpenTelemetry exporters are currently supported. Options include `console` and `otlp`.
+Set where to export metrics to in comma-separated format. Only a subset of the OpenTelemetry exporters are currently supported. Options include `otlp`, `console` and `none`.
 
 ---
 
@@ -250,8 +256,8 @@ Enable Log correlation. This will add the Trace ID, Span ID, and resource detail
 
 +++ 2.2.0
 
-Default: `console`
+Default: `otlp`
 
 Environment Variable: `OTEL_TRACES_EXPORTER`
 
-Set where to export traces to. Only a subset of the OpenTelemetry exporters are currently supported. Options include `console` and `otlp`.
+Set where to export traces to in comma-separated format. Only a subset of the OpenTelemetry exporters are currently supported. Options include `otlp`, `console` and `none`.
