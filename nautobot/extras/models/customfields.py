@@ -4,6 +4,8 @@ import json
 import logging
 import re
 
+from opentelemetry import trace as _otel_trace
+
 from django import forms
 from django.contrib.contenttypes.models import ContentType
 from django.core.cache import cache
@@ -58,22 +60,29 @@ class ComputedFieldManager(BaseManager.from_queryset(RestrictedQuerySet)):
         concrete_model = model._meta.concrete_model
         cache_key = f"{self.get_for_model.cache_key_prefix}.{concrete_model._meta.label_lower}"
         list_cache_key = f"{cache_key}.list"
-        if not get_queryset:
-            listing = cache.get(list_cache_key)
-            if listing is not None:
+        _tracer = _otel_trace.get_tracer("nautobot.extras.customfields")
+        with _tracer.start_as_current_span("computed_field_cache.get") as _span:
+            _span.set_attribute("customfield_cache.model", concrete_model._meta.label_lower)
+            if not get_queryset:
+                listing = cache.get(list_cache_key)
+                if listing is not None:
+                    _span.set_attribute("customfield_cache.hit", True)
+                    return listing
+            queryset = cache.get(cache_key)
+            if queryset is None:
+                _span.set_attribute("customfield_cache.hit", False)
+                content_type = ContentType.objects.get_for_model(concrete_model)
+                queryset = self.get_queryset().filter(content_type=content_type)
+                # cache is explicitly invalidated by nautobot.extras.signals.invalidate_models_cache
+                cache.set(cache_key, queryset, timeout=None)
+            else:
+                _span.set_attribute("customfield_cache.hit", True)
+            if not get_queryset:
+                listing = list(queryset)
+                # cache is explicitly invalidated by nautobot.extras.signals.invalidate_models_cache
+                cache.set(list_cache_key, listing, timeout=None)
                 return listing
-        queryset = cache.get(cache_key)
-        if queryset is None:
-            content_type = ContentType.objects.get_for_model(concrete_model)
-            queryset = self.get_queryset().filter(content_type=content_type)
-            # cache is explicitly invalidated by nautobot.extras.signals.invalidate_models_cache
-            cache.set(cache_key, queryset, timeout=None)
-        if not get_queryset:
-            listing = list(queryset)
-            # cache is explicitly invalidated by nautobot.extras.signals.invalidate_models_cache
-            cache.set(list_cache_key, listing, timeout=None)
-            return listing
-        return queryset
+            return queryset
 
     get_for_model.cache_key_prefix = "nautobot.extras.computedfield.get_for_model"
 
@@ -444,24 +453,32 @@ class CustomFieldManager(BaseManager.from_queryset(RestrictedQuerySet)):
             f"{self.get_for_model.cache_key_prefix}.{concrete_model._meta.label_lower}.{exclude_filter_disabled}"
         )
         list_cache_key = f"{cache_key}.list"
-        if not get_queryset:
-            listing = cache.get(list_cache_key)
-            if listing is not None:
+        _tracer = _otel_trace.get_tracer("nautobot.extras.customfields")
+        with _tracer.start_as_current_span("custom_field_cache.get") as _span:
+            _span.set_attribute("customfield_cache.model", concrete_model._meta.label_lower)
+            _span.set_attribute("customfield_cache.exclude_filter_disabled", exclude_filter_disabled)
+            if not get_queryset:
+                listing = cache.get(list_cache_key)
+                if listing is not None:
+                    _span.set_attribute("customfield_cache.hit", True)
+                    return listing
+            queryset = cache.get(cache_key)
+            if queryset is None:
+                _span.set_attribute("customfield_cache.hit", False)
+                content_type = ContentType.objects.get_for_model(concrete_model)
+                queryset = self.get_queryset().filter(content_types=content_type)
+                if exclude_filter_disabled:
+                    queryset = queryset.exclude(filter_logic=CustomFieldFilterLogicChoices.FILTER_DISABLED)
+                # cache is explicitly invalidated by nautobot.extras.signals.invalidate_models_cache
+                cache.set(cache_key, queryset, timeout=None)
+            else:
+                _span.set_attribute("customfield_cache.hit", True)
+            if not get_queryset:
+                listing = list(queryset)
+                # cache is explicitly invalidated by nautobot.extras.signals.invalidate_models_cache
+                cache.set(list_cache_key, listing, timeout=None)
                 return listing
-        queryset = cache.get(cache_key)
-        if queryset is None:
-            content_type = ContentType.objects.get_for_model(concrete_model)
-            queryset = self.get_queryset().filter(content_types=content_type)
-            if exclude_filter_disabled:
-                queryset = queryset.exclude(filter_logic=CustomFieldFilterLogicChoices.FILTER_DISABLED)
-            # cache is explicitly invalidated by nautobot.extras.signals.invalidate_models_cache
-            cache.set(cache_key, queryset, timeout=None)
-        if not get_queryset:
-            listing = list(queryset)
-            # cache is explicitly invalidated by nautobot.extras.signals.invalidate_models_cache
-            cache.set(list_cache_key, listing, timeout=None)
-            return listing
-        return queryset
+            return queryset
 
     get_for_model.cache_key_prefix = "nautobot.extras.customfield.get_for_model"
 
@@ -469,12 +486,18 @@ class CustomFieldManager(BaseManager.from_queryset(RestrictedQuerySet)):
         """Return list of all keys for CustomFields assigned to the given model."""
         concrete_model = model._meta.concrete_model
         cache_key = f"{self.keys_for_model.cache_key_prefix}.{concrete_model._meta.label_lower}"
-        keys = cache.get(cache_key)
-        if keys is None:
-            keys = list(self.get_for_model(model).values_list("key", flat=True))
-            # cache is explicitly invalidated by nautobot.extras.signals.invalidate_models_cache
-            cache.set(cache_key, keys, timeout=None)
-        return keys
+        _tracer = _otel_trace.get_tracer("nautobot.extras.customfields")
+        with _tracer.start_as_current_span("custom_field_keys_cache.get") as _span:
+            _span.set_attribute("customfield_cache.model", concrete_model._meta.label_lower)
+            keys = cache.get(cache_key)
+            if keys is None:
+                _span.set_attribute("customfield_cache.hit", False)
+                keys = list(self.get_for_model(model).values_list("key", flat=True))
+                # cache is explicitly invalidated by nautobot.extras.signals.invalidate_models_cache
+                cache.set(cache_key, keys, timeout=None)
+            else:
+                _span.set_attribute("customfield_cache.hit", True)
+            return keys
 
     keys_for_model.cache_key_prefix = "nautobot.extras.customfield.keys_for_model"
 

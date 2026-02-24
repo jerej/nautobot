@@ -15,6 +15,7 @@ A number of settings can alternatively be configured via the Nautobot Admin UI. 
 <!-- pyml disable-num-lines 5 blanks-around-lists -->
 {% for property, attrs in settings_schema.properties.items() %}
 {% if attrs.is_constance_config|default(false) %}
+
 * [`{{ property }}`](#{{ property|lower }})
 {% endif %}
 {% endfor %}
@@ -73,6 +74,7 @@ can specify additional apps with ease.  Similarly, additional `MIDDLEWARE` can b
 **Permitted Values:**
 
 {% for enum in attrs.enum %}
+
 * `{{ enum|pprint }}`
 {% endfor %}
 {% endif %}
@@ -83,6 +85,7 @@ can specify additional apps with ease.  Similarly, additional `MIDDLEWARE` can b
 **Environment Variables:**
 
 {% for environment_variable in attrs.environment_variables %}
+
 * `{{ environment_variable }}`
 {% endfor %}
 {% elif attrs.properties|default(None) != None and attrs.properties.default|default(None) != None %}
@@ -92,6 +95,7 @@ can specify additional apps with ease.  Similarly, additional `MIDDLEWARE` can b
 
 {% endif %}
 {% if property_attrs.environment_variable|default(None) %}
+
 * `{{ property_attrs.environment_variable }}`
 {% else %}
 {% for environment_variable in property_attrs.environment_variables %}
@@ -106,6 +110,7 @@ can specify additional apps with ease.  Similarly, additional `MIDDLEWARE` can b
 
 {% endif %}
 {% if property_attrs.environment_variable|default(None) %}
+
 * `{{ property_attrs.environment_variable }}`
 {% else %}
 {% for environment_variable in property_attrs.environment_variables %}
@@ -128,6 +133,7 @@ can specify additional apps with ease.  Similarly, additional `MIDDLEWARE` can b
 **See Also:**
 
 {% for text, url in attrs.see_also.items() %}
+
 * [ {{ text }} ]({{ url }})
 {% endfor %}
 {% endif %}
@@ -171,3 +177,87 @@ This setting is used internally in the core settings to provide default location
 
 !!! warning
     Do not override `NAUTOBOT_ROOT` in your `nautobot_config.py`. It will not work as expected. If you need to customize this setting, please always set the `NAUTOBOT_ROOT` environment variable.
+
+---
+
+### OTEL_EXPORTER_OTLP_ENDPOINT
+
++++ 2.2.0
+
+Default: ``
+
+Environment Variable: `OTEL_EXPORTER_OTLP_ENDPOINT`
+
+When exporting to `otlp`, specify the endpoint URL to send metrics and traces to.
+
+---
+
+### OTEL_EXPORTER_OTLP_INSECURE
+
++++ 2.2.0
+
+Default: `False`
+
+Environment Variable: `OTEL_EXPORTER_OTLP_INSECURE`
+
+When exporting to `otlp` with `grpc`, send as insecure.
+
+---
+
+### OTEL_EXPORTER_OTLP_PROTOCOL
+
++++ 2.2.0
+
+Default: `grpc`
+
+Environment Variable: `OTEL_EXPORTER_OTLP_PROTOCOL`
+
+When exporting to `otlp`, specify the protocol to send metrics and traces in. Options include `grpc` and `http`.
+
+---
+
+### OTEL_METRICS_EXPORTER
+
++++ 2.2.0
+
+Default: `console`
+
+Environment Variable: `OTEL_METRICS_EXPORTER`
+
+Set where to export metrics to in comma-separated format. Only a subset of the OpenTelemetry exporters are currently supported. Options include `otlp`, `console` and `none`.
+
+---
+
+### OTEL_PYTHON_DJANGO_INSTRUMENT
+
++++ 2.2.0
+
+Default: `False`
+
+Environment Variable: `OTEL_PYTHON_DJANGO_INSTRUMENT`
+
+Enable [OpenTelemetry](https://opentelemetry.io/) instumentation on Nautobot. This will allow for sending traces and metrics from Nautobot for underlying Django, Redis, Celery, Logging, and Database (Postgres or MySQL). This will generate OpenTelemetry formatted traces and metrics to be consumed by external observability tools.
+
+---
+
+### OTEL_PYTHON_LOG_CORRELATION
+
++++ 2.2.0
+
+Default: `True`
+
+Environment Variable: `OTEL_PYTHON_LOG_CORRELATION`
+
+Enable Log correlation. This will add the Trace ID, Span ID, and resource details to the logs.
+
+---
+
+### OTEL_TRACES_EXPORTER
+
++++ 2.2.0
+
+Default: `otlp`
+
+Environment Variable: `OTEL_TRACES_EXPORTER`
+
+Set where to export traces to in comma-separated format. Only a subset of the OpenTelemetry exporters are currently supported. Options include `otlp`, `console` and `none`.
