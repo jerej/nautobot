@@ -15,7 +15,6 @@ from django.core.management import CommandError, CommandParser, execute_from_com
 from django.core.management.utils import get_random_secret_key
 from jinja2 import BaseLoader, Environment
 
-from nautobot import __version__
 from nautobot.core.cli.opentelemetry import instrument
 from nautobot.core.events import load_event_brokers
 from nautobot.core.settings import OTEL_PYTHON_DJANGO_INSTRUMENT
