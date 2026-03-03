@@ -228,6 +228,7 @@ Set where to export metrics to in comma-separated format. Only a subset of the O
 
 ---
 
+<!-- pyml disable-next-line MD044 -->
 ### OTEL_PYTHON_DJANGO_INSTRUMENT
 
 +++ 2.2.0
@@ -240,6 +241,7 @@ Enable [OpenTelemetry](https://opentelemetry.io/) instumentation on Nautobot. Th
 
 ---
 
+<!-- pyml disable-next-line MD044 -->
 ### OTEL_PYTHON_LOG_CORRELATION
 
 +++ 2.2.0
