@@ -1,22 +1,26 @@
 from collections import OrderedDict
 from copy import deepcopy
 from functools import partial
+import json
 import logging
 import uuid
 
 from django.contrib import messages
+from django.contrib.auth.mixins import LoginRequiredMixin
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ObjectDoesNotExist, PermissionDenied, ValidationError
 from django.core.paginator import EmptyPage, PageNotAnInteger
 from django.db import IntegrityError, transaction
-from django.db.models import F, Prefetch
+from django.db.models import F, Prefetch, ProtectedError, Window
+from django.db.models.functions import RowNumber
 from django.forms import (
+    Form,
     modelformset_factory,
     ModelMultipleChoiceField,
     MultipleHiddenInput,
 )
-from django.http.response import HttpResponseRedirect
-from django.shortcuts import get_object_or_404, HttpResponse, redirect, render
+from django.http.response import HttpResponseBadRequest, HttpResponseRedirect
+from django.shortcuts import get_object_or_404, redirect, render
 from django.template import Context
 from django.template.loader import render_to_string
 from django.urls import reverse
@@ -60,6 +64,7 @@ from nautobot.core.utils.requests import normalize_querydict
 from nautobot.core.views import generic
 from nautobot.core.views.mixins import (
     GetReturnURLMixin,
+    NautobotViewSetMixin,
     ObjectBulkDestroyViewMixin,
     ObjectBulkRenameViewMixin,
     ObjectBulkUpdateViewMixin,
@@ -72,14 +77,27 @@ from nautobot.core.views.mixins import (
     ObjectPermissionRequiredMixin,
 )
 from nautobot.core.views.paginator import EnhancedPaginator, get_paginate_count
-from nautobot.core.views.utils import common_detail_view_context, get_obj_from_context
+from nautobot.core.views.utils import (
+    borrow_extras_fields,
+    common_detail_view_context,
+    get_obj_from_context,
+    handle_protectederror,
+)
 from nautobot.core.views.viewsets import NautobotUIViewSet
 from nautobot.dcim.choices import LocationDataToContactActionChoices
+from nautobot.dcim.constants import DEVICE_COMPONENT_ICONS, TERMINATION_CABLE_COLUMN_FK_FIELDS
 from nautobot.dcim.forms import LocationMigrateDataToContactForm
-from nautobot.dcim.utils import get_all_network_driver_mappings, render_software_version_and_image_files
+from nautobot.dcim.utils import (
+    generate_cable_breakout_mapping,
+    get_all_network_driver_mappings,
+    get_connected_endpoint_panels,
+    get_connected_endpoint_tables,
+    render_software_version_and_image_files,
+    validate_cable_breakout_mapping,
+)
 from nautobot.extras.models import ConfigContext, Contact, ContactAssociation, Role, SavedView, Status, Team
 from nautobot.extras.tables import DynamicGroupTable, ImageAttachmentTable
-from nautobot.ipam.models import IPAddress
+from nautobot.ipam.models import IPAddress, VLAN
 from nautobot.ipam.tables import (
     InterfaceIPAddressTable,
     InterfaceVLANTable,
@@ -106,6 +124,8 @@ from .constants import DEVICE_RECURSION_DEPTH_LIMIT, NONCONNECTABLE_IFACE_TYPES
 from .models import (
     Cable,
     CablePath,
+    CableToCableTermination,
+    CableType,
     ConsolePort,
     ConsolePortTemplate,
     ConsoleServerPort,
@@ -151,6 +171,9 @@ from .models import (
     VirtualChassis,
     VirtualDeviceContext,
 )
+from .svg.path_trace import CableTraceSVG
+from .termination_field_set import CableTerminationFieldSet
+from .utils import disconnect_termination
 
 logger = logging.getLogger(__name__)
 
@@ -185,16 +208,37 @@ class BulkDisconnectView(GetReturnURLMixin, ObjectPermissionRequiredMixin, View)
             if form.is_valid():
                 with transaction.atomic():
                     count = 0
+                    disconnected_cables = []
                     for obj in self.queryset.filter(pk__in=form.cleaned_data["pk"]):
                         if obj.cable is None:
                             continue
-                        obj.cable.delete()
+                        cable_label = str(obj.cable)
+                        cable_url = obj.cable.get_absolute_url()
+
+                        disconnect_termination(obj)
+
+                        disconnected_cables.append((cable_label, cable_url))
                         count += 1
 
                 messages.success(
                     request,
                     f"Disconnected {count} {self.queryset.model._meta.verbose_name_plural}",
                 )
+                # Inform the user that the surviving cables can still be cleaned up. One
+                # aggregated message with a bullet list, not one toast per cable.
+                if disconnected_cables:
+                    cable_items = format_html_join(
+                        "",
+                        '<li><a href="{}">{}</a> (<a href="{}delete/">delete</a>)</li>',
+                        ((cable_url, cable_label, cable_url) for cable_label, cable_url in disconnected_cables),
+                    )
+                    messages.info(
+                        request,
+                        format_html(
+                            "The following cables still exist — delete any that are no longer needed:<ul>{}</ul>",
+                            cable_items,
+                        ),
+                    )
 
                 return redirect(return_url)
 
@@ -1610,63 +1654,63 @@ class DeviceTypeUIViewSet(NautobotUIViewSet):
                         weight=100,
                         link_name="dcim:devicetype_consoleporttemplate_add",
                         label="Console Ports",
-                        icon="mdi-console",
+                        icon=DEVICE_COMPONENT_ICONS["consoleporttemplate"],
                         required_permissions=["dcim.add_consoleporttemplate"],
                     ),
                     object_detail.Button(
                         weight=200,
                         link_name="dcim:devicetype_consoleserverporttemplate_add",
                         label="Console Server Ports",
-                        icon="mdi-console-network-outline",
+                        icon=DEVICE_COMPONENT_ICONS["consoleserverporttemplate"],
                         required_permissions=["dcim.add_consoleserverporttemplate"],
                     ),
                     object_detail.Button(
                         weight=300,
                         link_name="dcim:devicetype_powerporttemplate_add",
                         label="Power Ports",
-                        icon="mdi-power-plug-outline",
+                        icon=DEVICE_COMPONENT_ICONS["powerporttemplate"],
                         required_permissions=["dcim.add_powerporttemplate"],
                     ),
                     object_detail.Button(
                         weight=400,
                         link_name="dcim:devicetype_poweroutlettemplate_add",
                         label="Power Outlets",
-                        icon="mdi-power-socket",
+                        icon=DEVICE_COMPONENT_ICONS["poweroutlettemplate"],
                         required_permissions=["dcim.add_poweroutlettemplate"],
                     ),
                     object_detail.Button(
                         weight=500,
                         link_name="dcim:devicetype_interfacetemplate_add",
                         label="Interfaces",
-                        icon="mdi-ethernet",
+                        icon=DEVICE_COMPONENT_ICONS["interfacetemplate"],
                         required_permissions=["dcim.add_interfacetemplate"],
                     ),
                     object_detail.Button(
                         weight=600,
                         link_name="dcim:devicetype_frontporttemplate_add",
                         label="Front Ports",
-                        icon="mdi-square-rounded-outline",
+                        icon=DEVICE_COMPONENT_ICONS["frontporttemplate"],
                         required_permissions=["dcim.add_frontporttemplate"],
                     ),
                     object_detail.Button(
                         weight=700,
                         link_name="dcim:devicetype_rearporttemplate_add",
                         label="Rear Ports",
-                        icon="mdi-square-rounded-outline",
+                        icon=DEVICE_COMPONENT_ICONS["rearporttemplate"],
                         required_permissions=["dcim.add_rearporttemplate"],
                     ),
                     object_detail.Button(
                         weight=800,
                         link_name="dcim:devicetype_devicebaytemplate_add",
                         label="Device Bays",
-                        icon="mdi-circle-outline",
+                        icon=DEVICE_COMPONENT_ICONS["devicebaytemplate"],
                         required_permissions=["dcim.add_devicebaytemplate"],
                     ),
                     object_detail.Button(
                         weight=900,
                         link_name="dcim:devicetype_modulebaytemplate_add",
                         label="Module Bays",
-                        icon="mdi-tray",
+                        icon=DEVICE_COMPONENT_ICONS["modulebaytemplate"],
                         required_permissions=["dcim.add_modulebaytemplate"],
                     ),
                 ),
@@ -1916,7 +1960,7 @@ class ModuleTypeUIViewSet(
                         link_name="dcim:consoleporttemplate_add",
                         tab="consoleports",
                         label="Console Ports",
-                        icon="mdi-console",
+                        icon=DEVICE_COMPONENT_ICONS["consoleporttemplate"],
                         required_permissions=["dcim.add_consoleporttemplate"],
                     ),
                     ModuleTypeComponentAddButton(
@@ -1924,7 +1968,7 @@ class ModuleTypeUIViewSet(
                         link_name="dcim:consoleserverporttemplate_add",
                         tab="consoleserverports",
                         label="Console Server Ports",
-                        icon="mdi-console-network-outline",
+                        icon=DEVICE_COMPONENT_ICONS["consoleserverporttemplate"],
                         required_permissions=["dcim.add_consoleserverporttemplate"],
                     ),
                     ModuleTypeComponentAddButton(
@@ -1932,7 +1976,7 @@ class ModuleTypeUIViewSet(
                         link_name="dcim:powerporttemplate_add",
                         tab="powerports",
                         label="Power Ports",
-                        icon="mdi-power-plug-outline",
+                        icon=DEVICE_COMPONENT_ICONS["powerporttemplate"],
                         required_permissions=["dcim.add_powerporttemplate"],
                     ),
                     ModuleTypeComponentAddButton(
@@ -1940,7 +1984,7 @@ class ModuleTypeUIViewSet(
                         link_name="dcim:poweroutlettemplate_add",
                         tab="poweroutlets",
                         label="Power Outlets",
-                        icon="mdi-power-socket",
+                        icon=DEVICE_COMPONENT_ICONS["poweroutlettemplate"],
                         required_permissions=["dcim.add_poweroutlettemplate"],
                     ),
                     ModuleTypeComponentAddButton(
@@ -1948,7 +1992,7 @@ class ModuleTypeUIViewSet(
                         link_name="dcim:interfacetemplate_add",
                         tab="interfaces",
                         label="Interfaces",
-                        icon="mdi-ethernet",
+                        icon=DEVICE_COMPONENT_ICONS["interfacetemplate"],
                         required_permissions=["dcim.add_interfacetemplate"],
                     ),
                     ModuleTypeComponentAddButton(
@@ -1956,7 +2000,7 @@ class ModuleTypeUIViewSet(
                         link_name="dcim:frontporttemplate_add",
                         tab="frontports",
                         label="Front Ports",
-                        icon="mdi-square-rounded-outline",
+                        icon=DEVICE_COMPONENT_ICONS["frontporttemplate"],
                         required_permissions=["dcim.add_frontporttemplate"],
                     ),
                     ModuleTypeComponentAddButton(
@@ -1964,7 +2008,7 @@ class ModuleTypeUIViewSet(
                         link_name="dcim:rearporttemplate_add",
                         tab="rearports",
                         label="Rear Ports",
-                        icon="mdi-square-rounded-outline",
+                        icon=DEVICE_COMPONENT_ICONS["rearporttemplate"],
                         required_permissions=["dcim.add_rearporttemplate"],
                     ),
                     ModuleTypeComponentAddButton(
@@ -1972,7 +2016,7 @@ class ModuleTypeUIViewSet(
                         link_name="dcim:modulebaytemplate_add",
                         tab="modulebays",
                         label="Module Bays",
-                        icon="mdi-tray",
+                        icon=DEVICE_COMPONENT_ICONS["modulebaytemplate"],
                         required_permissions=["dcim.add_modulebaytemplate"],
                     ),
                 ),
@@ -2177,42 +2221,182 @@ class ModuleTypeUIViewSet(
         )
 
 
+class ComponentCreateViewMixin(ObjectEditViewMixin):
+    """
+    UI mixin to bulk-create device/module component template instances from a single
+    parent form using `name_pattern`/`label_pattern` expansion.
+
+    Specializes `ObjectEditViewMixin` by overriding `create()` with the bulk-component
+    flow; update/edit behavior (`update()`, `perform_update()`, `_process_create_or_update_form`,
+    etc.) is inherited unchanged.
+    """
+
+    create_form_class: type[Form]
+    form_class: type[Form]
+    create_template_name = "generic/object_create.html"
+
+    def get_component_create_form(self, request, data=None):
+        """Return the parent bulk-create form (with `name_pattern`/`label_pattern` fields).
+
+        The "extras" fields (custom fields, relationships, object note, dynamic groups) are declared
+        on the per-instance model form, not on the create form. Borrow them onto the create form so
+        they render (and validate) on the single bulk-create form, without redeclaring them on every
+        *CreateForm and without passing a separate `model_form` to the template.
+        """
+        create_form = self.create_form_class(  # pylint: disable=not-callable
+            data or None,
+            initial=normalize_querydict(request.GET, form_class=self.create_form_class),
+        )
+        # Pass `data` through: some model forms (e.g. VMInterfaceForm) resolve a required parent
+        # (virtual_machine) in __init__ from the bound data / GET initial, so instantiating with no
+        # data at all would raise DoesNotExist.
+        model_form = self.get_component_model_form(request, data=data)
+        # The *CreateForm is a plain `forms.Form` (no custom-field/relationship support of its own); borrow
+        # the extras fields + grouping metadata off the model form so they render/validate on it.
+        borrow_extras_fields(create_form, model_form)
+        return create_form
+
+    def get_selected_objects_parents_name(self, selected_objects):
+        """Return the display name of the parent object that owns the selected components or templates."""
+        selected_object = selected_objects.first()
+        if selected_object:
+            parent_attrs = ("device", "device_type", "module", "module_type", "virtual_machine")
+            for attr in parent_attrs:
+                parent = getattr(selected_object, attr, None)
+                if parent:
+                    return parent.name if attr == "virtual_machine" else parent.display
+        return ""
+
+    def get_component_model_form(self, request, data=None):
+        """Return the per-instance component model form used to validate/save each expanded child."""
+        return self.form_class(  # pylint: disable=not-callable
+            data or None,
+            initial=normalize_querydict(request.GET, form_class=self.form_class),
+        )
+
+    def create(self, request, *args, **kwargs):
+        """
+        Component bulk-create entry point. Overrides the inherited single-object create
+        flow so that GET renders the bulk-create form and POST expands `name_pattern`/
+        `label_pattern` into individual component instances via
+        `process_component_create_form()`.
+        """
+        if request.method == "POST":
+            return self.process_component_create_form(request, *args, **kwargs)
+
+        return self.render_component_create_response(request)
+
+    def process_component_create_form(self, request, *args, **kwargs):
+        """
+        Validate the parent bulk-create form, expand the patterns into individual child
+        component forms, and save them atomically. Errors on any expanded child form are
+        re-raised on the parent form's `name_pattern`/`label_pattern` fields.
+        """
+        create_form = self.get_component_create_form(request, data=request.POST)
+
+        if not create_form.is_valid():
+            return self.render_component_create_response(request, create_form)
+
+        new_components = []
+        # `get_component_create_form` borrows the "extras" fields (custom fields, relationships, object
+        # note, dynamic groups) onto the create form, so `cleaned_data` already carries their validated
+        # values; they flow through to each per-instance form via `data` below.
+        data = deepcopy(create_form.cleaned_data)
+
+        # Support for bulk creation using name_pattern and label_pattern
+        names = create_form.cleaned_data["name_pattern"]
+        labels = create_form.cleaned_data.get("label_pattern")
+
+        # Create multiple objects based on the name_pattern
+        for i, name in enumerate(names):
+            label = labels[i] if labels else None
+            # Initialize the individual component form
+            data["name"] = name
+            data["label"] = label
+            if hasattr(create_form, "get_iterative_data"):
+                data.update(create_form.get_iterative_data(i))
+
+            # Recreate the form for each iteration with updated data
+            component_form = self.get_component_model_form(request, data=data)
+            if component_form.is_valid():
+                new_components.append(component_form)
+            else:
+                for field, errors in component_form.errors.as_data().items():
+                    # Assign errors on the child form's name/label field to name_pattern/label_pattern on the parent form
+                    parent_field = {
+                        "name": "name_pattern",
+                        "label": "label_pattern",
+                        "breakout_position": "breakout_position_pattern",
+                    }.get(field, field)
+                    for e in errors:
+                        err_str = ", ".join(e)
+                        if parent_field in create_form.fields:
+                            create_form.add_error(parent_field, f"{name}: {err_str}")
+                        else:
+                            create_form.add_error(None, f"{name} ({field}): {err_str}")
+
+        if create_form.errors:
+            return self.render_component_create_response(request, create_form)
+
+        try:
+            with transaction.atomic():
+                # Create the new components
+                new_objs = [component_form.save() for component_form in new_components]
+
+                # Enforce object-level permissions
+                if self.get_queryset().filter(pk__in=[obj.pk for obj in new_objs]).count() != len(new_objs):
+                    raise ObjectDoesNotExist
+
+            messages.success(
+                request,
+                f"Added {len(new_components)} {self.queryset.model._meta.verbose_name_plural}",
+            )
+
+            if "_addanother" in request.POST:
+                next_url = request.get_full_path()
+                if url_has_allowed_host_and_scheme(url=next_url, allowed_hosts={request.get_host()}):
+                    return redirect(iri_to_uri(next_url))
+            return redirect(self.get_return_url(request))
+
+        except ObjectDoesNotExist:
+            create_form.add_error(None, "Component creation failed due to object-level permissions violation")
+        return self.render_component_create_response(request, create_form)
+
+    def render_component_create_response(self, request, create_form=None):
+        """Render the component bulk-create template with the parent and per-instance forms."""
+        if create_form is None:
+            create_form = self.get_component_create_form(
+                request, data=request.POST if request.method == "POST" else None
+            )
+
+        return Response(
+            {
+                "template": self.create_template_name,
+                "form": create_form,
+                "return_url": self.get_return_url(request),
+            },
+        )
+
+
 #
 # Console port templates
 #
 
 
-class ConsolePortTemplateCreateView(generic.ComponentCreateView):
+class ConsolePortTemplateUIViewSet(
+    ComponentCreateViewMixin,
+    ObjectBulkRenameViewMixin,
+    ObjectDestroyViewMixin,
+    ObjectBulkDestroyViewMixin,
+    ObjectBulkUpdateViewMixin,
+):
+    bulk_update_form_class = forms.ConsolePortTemplateBulkEditForm
+    filterset_class = filters.ConsolePortTemplateFilterSet
+    form_class = forms.ConsolePortTemplateForm
+    serializer_class = serializers.ConsolePortTemplateSerializer
+    table_class = tables.ConsolePortTemplateTable
     queryset = ConsolePortTemplate.objects.all()
-    form = forms.ConsolePortTemplateCreateForm
-    model_form = forms.ConsolePortTemplateForm
-    template_name = "dcim/device_component_add.html"
-
-
-class ConsolePortTemplateEditView(generic.ObjectEditView):
-    queryset = ConsolePortTemplate.objects.all()
-    model_form = forms.ConsolePortTemplateForm
-
-
-class ConsolePortTemplateDeleteView(generic.ObjectDeleteView):
-    queryset = ConsolePortTemplate.objects.all()
-
-
-class ConsolePortTemplateBulkEditView(generic.BulkEditView):
-    queryset = ConsolePortTemplate.objects.all()
-    table = tables.ConsolePortTemplateTable
-    form = forms.ConsolePortTemplateBulkEditForm
-    filterset = filters.ConsolePortTemplateFilterSet
-
-
-class ConsolePortTemplateBulkRenameView(BaseDeviceComponentTemplatesBulkRenameView):
-    queryset = ConsolePortTemplate.objects.all()
-
-
-class ConsolePortTemplateBulkDeleteView(generic.BulkDeleteView):
-    queryset = ConsolePortTemplate.objects.all()
-    table = tables.ConsolePortTemplateTable
-    filterset = filters.ConsolePortTemplateFilterSet
+    create_form_class = forms.ConsolePortTemplateCreateForm
 
 
 #
@@ -2220,37 +2404,20 @@ class ConsolePortTemplateBulkDeleteView(generic.BulkDeleteView):
 #
 
 
-class ConsoleServerPortTemplateCreateView(generic.ComponentCreateView):
+class ConsoleServerPortTemplateUIViewSet(
+    ComponentCreateViewMixin,
+    ObjectBulkRenameViewMixin,
+    ObjectDestroyViewMixin,
+    ObjectBulkDestroyViewMixin,
+    ObjectBulkUpdateViewMixin,
+):
+    bulk_update_form_class = forms.ConsoleServerPortTemplateBulkEditForm
+    filterset_class = filters.ConsoleServerPortTemplateFilterSet
+    form_class = forms.ConsoleServerPortTemplateForm
+    serializer_class = serializers.ConsoleServerPortTemplateSerializer
+    table_class = tables.ConsoleServerPortTemplateTable
     queryset = ConsoleServerPortTemplate.objects.all()
-    form = forms.ConsoleServerPortTemplateCreateForm
-    model_form = forms.ConsoleServerPortTemplateForm
-    template_name = "dcim/device_component_add.html"
-
-
-class ConsoleServerPortTemplateEditView(generic.ObjectEditView):
-    queryset = ConsoleServerPortTemplate.objects.all()
-    model_form = forms.ConsoleServerPortTemplateForm
-
-
-class ConsoleServerPortTemplateDeleteView(generic.ObjectDeleteView):
-    queryset = ConsoleServerPortTemplate.objects.all()
-
-
-class ConsoleServerPortTemplateBulkEditView(generic.BulkEditView):
-    queryset = ConsoleServerPortTemplate.objects.all()
-    table = tables.ConsoleServerPortTemplateTable
-    form = forms.ConsoleServerPortTemplateBulkEditForm
-    filterset = filters.ConsoleServerPortTemplateFilterSet
-
-
-class ConsoleServerPortTemplateBulkRenameView(BaseDeviceComponentTemplatesBulkRenameView):
-    queryset = ConsoleServerPortTemplate.objects.all()
-
-
-class ConsoleServerPortTemplateBulkDeleteView(generic.BulkDeleteView):
-    queryset = ConsoleServerPortTemplate.objects.all()
-    table = tables.ConsoleServerPortTemplateTable
-    filterset = filters.ConsoleServerPortTemplateFilterSet
+    create_form_class = forms.ConsoleServerPortTemplateCreateForm
 
 
 #
@@ -2258,37 +2425,20 @@ class ConsoleServerPortTemplateBulkDeleteView(generic.BulkDeleteView):
 #
 
 
-class PowerPortTemplateCreateView(generic.ComponentCreateView):
+class PowerPortTemplateUIViewSet(
+    ComponentCreateViewMixin,
+    ObjectBulkRenameViewMixin,
+    ObjectDestroyViewMixin,
+    ObjectBulkDestroyViewMixin,
+    ObjectBulkUpdateViewMixin,
+):
+    bulk_update_form_class = forms.PowerPortTemplateBulkEditForm
+    filterset_class = filters.PowerPortTemplateFilterSet
+    form_class = forms.PowerPortTemplateForm
+    serializer_class = serializers.PowerPortTemplateSerializer
+    table_class = tables.PowerPortTemplateTable
     queryset = PowerPortTemplate.objects.all()
-    form = forms.PowerPortTemplateCreateForm
-    model_form = forms.PowerPortTemplateForm
-    template_name = "dcim/device_component_add.html"
-
-
-class PowerPortTemplateEditView(generic.ObjectEditView):
-    queryset = PowerPortTemplate.objects.all()
-    model_form = forms.PowerPortTemplateForm
-
-
-class PowerPortTemplateDeleteView(generic.ObjectDeleteView):
-    queryset = PowerPortTemplate.objects.all()
-
-
-class PowerPortTemplateBulkEditView(generic.BulkEditView):
-    queryset = PowerPortTemplate.objects.all()
-    table = tables.PowerPortTemplateTable
-    form = forms.PowerPortTemplateBulkEditForm
-    filterset = filters.PowerPortTemplateFilterSet
-
-
-class PowerPortTemplateBulkRenameView(BaseDeviceComponentTemplatesBulkRenameView):
-    queryset = PowerPortTemplate.objects.all()
-
-
-class PowerPortTemplateBulkDeleteView(generic.BulkDeleteView):
-    queryset = PowerPortTemplate.objects.all()
-    table = tables.PowerPortTemplateTable
-    filterset = filters.PowerPortTemplateFilterSet
+    create_form_class = forms.PowerPortTemplateCreateForm
 
 
 #
@@ -2296,37 +2446,20 @@ class PowerPortTemplateBulkDeleteView(generic.BulkDeleteView):
 #
 
 
-class PowerOutletTemplateCreateView(generic.ComponentCreateView):
+class PowerOutletTemplateUIViewSet(
+    ComponentCreateViewMixin,
+    ObjectBulkRenameViewMixin,
+    ObjectDestroyViewMixin,
+    ObjectBulkDestroyViewMixin,
+    ObjectBulkUpdateViewMixin,
+):
+    bulk_update_form_class = forms.PowerOutletTemplateBulkEditForm
+    filterset_class = filters.PowerOutletTemplateFilterSet
+    form_class = forms.PowerOutletTemplateForm
+    serializer_class = serializers.PowerOutletTemplateSerializer
+    table_class = tables.PowerOutletTemplateTable
     queryset = PowerOutletTemplate.objects.all()
-    form = forms.PowerOutletTemplateCreateForm
-    model_form = forms.PowerOutletTemplateForm
-    template_name = "dcim/device_component_add.html"
-
-
-class PowerOutletTemplateEditView(generic.ObjectEditView):
-    queryset = PowerOutletTemplate.objects.all()
-    model_form = forms.PowerOutletTemplateForm
-
-
-class PowerOutletTemplateDeleteView(generic.ObjectDeleteView):
-    queryset = PowerOutletTemplate.objects.all()
-
-
-class PowerOutletTemplateBulkEditView(generic.BulkEditView):
-    queryset = PowerOutletTemplate.objects.all()
-    table = tables.PowerOutletTemplateTable
-    form = forms.PowerOutletTemplateBulkEditForm
-    filterset = filters.PowerOutletTemplateFilterSet
-
-
-class PowerOutletTemplateBulkRenameView(BaseDeviceComponentTemplatesBulkRenameView):
-    queryset = PowerOutletTemplate.objects.all()
-
-
-class PowerOutletTemplateBulkDeleteView(generic.BulkDeleteView):
-    queryset = PowerOutletTemplate.objects.all()
-    table = tables.PowerOutletTemplateTable
-    filterset = filters.PowerOutletTemplateFilterSet
+    create_form_class = forms.PowerOutletTemplateCreateForm
 
 
 #
@@ -2334,36 +2467,20 @@ class PowerOutletTemplateBulkDeleteView(generic.BulkDeleteView):
 #
 
 
-class InterfaceTemplateCreateView(generic.ComponentCreateView):
+class InterfaceTemplateUIViewSet(
+    ComponentCreateViewMixin,
+    ObjectBulkRenameViewMixin,
+    ObjectDestroyViewMixin,
+    ObjectBulkDestroyViewMixin,
+    ObjectBulkUpdateViewMixin,
+):
+    bulk_update_form_class = forms.InterfaceTemplateBulkEditForm
+    filterset_class = filters.InterfaceTemplateFilterSet
+    form_class = forms.InterfaceTemplateForm
+    serializer_class = serializers.InterfaceTemplateSerializer
+    table_class = tables.InterfaceTemplateTable
     queryset = InterfaceTemplate.objects.all()
-    form = forms.InterfaceTemplateCreateForm
-    model_form = forms.InterfaceTemplateForm
-
-
-class InterfaceTemplateEditView(generic.ObjectEditView):
-    queryset = InterfaceTemplate.objects.all()
-    model_form = forms.InterfaceTemplateForm
-
-
-class InterfaceTemplateDeleteView(generic.ObjectDeleteView):
-    queryset = InterfaceTemplate.objects.all()
-
-
-class InterfaceTemplateBulkEditView(generic.BulkEditView):
-    queryset = InterfaceTemplate.objects.all()
-    table = tables.InterfaceTemplateTable
-    form = forms.InterfaceTemplateBulkEditForm
-    filterset = filters.InterfaceTemplateFilterSet
-
-
-class InterfaceTemplateBulkRenameView(BaseDeviceComponentTemplatesBulkRenameView):
-    queryset = InterfaceTemplate.objects.all()
-
-
-class InterfaceTemplateBulkDeleteView(generic.BulkDeleteView):
-    queryset = InterfaceTemplate.objects.all()
-    table = tables.InterfaceTemplateTable
-    filterset = filters.InterfaceTemplateFilterSet
+    create_form_class = forms.InterfaceTemplateCreateForm
 
 
 #
@@ -2371,36 +2488,20 @@ class InterfaceTemplateBulkDeleteView(generic.BulkDeleteView):
 #
 
 
-class FrontPortTemplateCreateView(generic.ComponentCreateView):
+class FrontPortTemplateUIViewSet(
+    ComponentCreateViewMixin,
+    ObjectBulkRenameViewMixin,
+    ObjectDestroyViewMixin,
+    ObjectBulkDestroyViewMixin,
+    ObjectBulkUpdateViewMixin,
+):
+    bulk_update_form_class = forms.FrontPortTemplateBulkEditForm
+    filterset_class = filters.FrontPortTemplateFilterSet
+    form_class = forms.FrontPortTemplateForm
+    serializer_class = serializers.FrontPortTemplateSerializer
+    table_class = tables.FrontPortTemplateTable
     queryset = FrontPortTemplate.objects.all()
-    form = forms.FrontPortTemplateCreateForm
-    model_form = forms.FrontPortTemplateForm
-
-
-class FrontPortTemplateEditView(generic.ObjectEditView):
-    queryset = FrontPortTemplate.objects.all()
-    model_form = forms.FrontPortTemplateForm
-
-
-class FrontPortTemplateDeleteView(generic.ObjectDeleteView):
-    queryset = FrontPortTemplate.objects.all()
-
-
-class FrontPortTemplateBulkEditView(generic.BulkEditView):
-    queryset = FrontPortTemplate.objects.all()
-    table = tables.FrontPortTemplateTable
-    form = forms.FrontPortTemplateBulkEditForm
-    filterset = filters.FrontPortTemplateFilterSet
-
-
-class FrontPortTemplateBulkRenameView(BaseDeviceComponentTemplatesBulkRenameView):
-    queryset = FrontPortTemplate.objects.all()
-
-
-class FrontPortTemplateBulkDeleteView(generic.BulkDeleteView):
-    queryset = FrontPortTemplate.objects.all()
-    table = tables.FrontPortTemplateTable
-    filterset = filters.FrontPortTemplateFilterSet
+    create_form_class = forms.FrontPortTemplateCreateForm
 
 
 #
@@ -2408,36 +2509,20 @@ class FrontPortTemplateBulkDeleteView(generic.BulkDeleteView):
 #
 
 
-class RearPortTemplateCreateView(generic.ComponentCreateView):
+class RearPortTemplateUIViewSet(
+    ComponentCreateViewMixin,
+    ObjectBulkRenameViewMixin,
+    ObjectDestroyViewMixin,
+    ObjectBulkDestroyViewMixin,
+    ObjectBulkUpdateViewMixin,
+):
+    bulk_update_form_class = forms.RearPortTemplateBulkEditForm
+    filterset_class = filters.RearPortTemplateFilterSet
+    form_class = forms.RearPortTemplateForm
+    serializer_class = serializers.RearPortTemplateSerializer
+    table_class = tables.RearPortTemplateTable
     queryset = RearPortTemplate.objects.all()
-    form = forms.RearPortTemplateCreateForm
-    model_form = forms.RearPortTemplateForm
-
-
-class RearPortTemplateEditView(generic.ObjectEditView):
-    queryset = RearPortTemplate.objects.all()
-    model_form = forms.RearPortTemplateForm
-
-
-class RearPortTemplateDeleteView(generic.ObjectDeleteView):
-    queryset = RearPortTemplate.objects.all()
-
-
-class RearPortTemplateBulkEditView(generic.BulkEditView):
-    queryset = RearPortTemplate.objects.all()
-    table = tables.RearPortTemplateTable
-    form = forms.RearPortTemplateBulkEditForm
-    filterset = filters.RearPortTemplateFilterSet
-
-
-class RearPortTemplateBulkRenameView(BaseDeviceComponentTemplatesBulkRenameView):
-    queryset = RearPortTemplate.objects.all()
-
-
-class RearPortTemplateBulkDeleteView(generic.BulkDeleteView):
-    queryset = RearPortTemplate.objects.all()
-    table = tables.RearPortTemplateTable
-    filterset = filters.RearPortTemplateFilterSet
+    create_form_class = forms.RearPortTemplateCreateForm
 
 
 #
@@ -2445,36 +2530,20 @@ class RearPortTemplateBulkDeleteView(generic.BulkDeleteView):
 #
 
 
-class DeviceBayTemplateCreateView(generic.ComponentCreateView):
+class DeviceBayTemplateUIViewSet(
+    ComponentCreateViewMixin,
+    ObjectBulkRenameViewMixin,
+    ObjectDestroyViewMixin,
+    ObjectBulkDestroyViewMixin,
+    ObjectBulkUpdateViewMixin,
+):
+    bulk_update_form_class = forms.DeviceBayTemplateBulkEditForm
+    filterset_class = filters.DeviceBayTemplateFilterSet
+    form_class = forms.DeviceBayTemplateForm
+    serializer_class = serializers.DeviceBayTemplateSerializer
+    table_class = tables.DeviceBayTemplateTable
     queryset = DeviceBayTemplate.objects.all()
-    form = forms.DeviceBayTemplateCreateForm
-    model_form = forms.DeviceBayTemplateForm
-
-
-class DeviceBayTemplateEditView(generic.ObjectEditView):
-    queryset = DeviceBayTemplate.objects.all()
-    model_form = forms.DeviceBayTemplateForm
-
-
-class DeviceBayTemplateDeleteView(generic.ObjectDeleteView):
-    queryset = DeviceBayTemplate.objects.all()
-
-
-class DeviceBayTemplateBulkEditView(generic.BulkEditView):
-    queryset = DeviceBayTemplate.objects.all()
-    table = tables.DeviceBayTemplateTable
-    form = forms.DeviceBayTemplateBulkEditForm
-    filterset = filters.DeviceBayTemplateFilterSet
-
-
-class DeviceBayTemplateBulkRenameView(BaseDeviceComponentTemplatesBulkRenameView):
-    queryset = DeviceBayTemplate.objects.all()
-
-
-class DeviceBayTemplateBulkDeleteView(generic.BulkDeleteView):
-    queryset = DeviceBayTemplate.objects.all()
-    table = tables.DeviceBayTemplateTable
-    filterset = filters.DeviceBayTemplateFilterSet
+    create_form_class = forms.DeviceBayTemplateCreateForm
 
 
 #
@@ -2534,12 +2603,14 @@ class ModuleBayCommonViewSetMixin:
                     new_components.append(component_form)
                 else:
                     for field, errors in component_form.errors.as_data().items():
-                        # Assign errors on the child form's name/position/label field to *_pattern fields on the parent form
-                        if field.endswith("_pattern"):
-                            field = field[:-8]
+                        parent_field = {
+                            "name": "name_pattern",
+                            "label": "label_pattern",
+                            "position": "position_pattern",
+                        }.get(field, field)
                         for e in errors:
                             err_str = ", ".join(e)
-                            form.add_error(field, f"{name}: {err_str}")
+                            form.add_error(parent_field, f"{name}: {err_str}")
 
             if not form.errors:
                 try:
@@ -2594,7 +2665,7 @@ class ModuleBayTemplateUIViewSet(
     model_form_class = forms.ModuleBayTemplateForm
     serializer_class = serializers.ModuleBayTemplateSerializer
     table_class = tables.ModuleBayTemplateTable
-    create_template_name = "dcim/device_component_add.html"
+    create_template_name = "generic/object_create.html"
     object_detail_content = None
 
     def get_selected_objects_parents_name(self, selected_objects):
@@ -3058,70 +3129,70 @@ class DeviceUIViewSet(NautobotUIViewSet):
                         weight=100,
                         link_name="dcim:device_consoleports_add",
                         label="Console Ports",
-                        icon="mdi-console",
+                        icon=DEVICE_COMPONENT_ICONS["consoleport"],
                         required_permissions=["dcim.add_consoleport"],
                     ),
                     object_detail.Button(
                         weight=200,
                         link_name="dcim:device_consoleserverports_add",
                         label="Console Server Ports",
-                        icon="mdi-console-network-outline",
+                        icon=DEVICE_COMPONENT_ICONS["consoleserverport"],
                         required_permissions=["dcim.add_consoleserverport"],
                     ),
                     object_detail.Button(
                         weight=300,
                         link_name="dcim:device_powerports_add",
                         label="Power Ports",
-                        icon="mdi-power-plug-outline",
+                        icon=DEVICE_COMPONENT_ICONS["powerport"],
                         required_permissions=["dcim.add_powerport"],
                     ),
                     object_detail.Button(
                         weight=400,
                         link_name="dcim:device_poweroutlets_add",
                         label="Power Outlets",
-                        icon="mdi-power-socket",
+                        icon=DEVICE_COMPONENT_ICONS["poweroutlet"],
                         required_permissions=["dcim.add_poweroutlet"],
                     ),
                     object_detail.Button(
                         weight=500,
                         link_name="dcim:device_interfaces_add",
                         label="Interfaces",
-                        icon="mdi-ethernet",
+                        icon=DEVICE_COMPONENT_ICONS["interface"],
                         required_permissions=["dcim.add_interface"],
                     ),
                     object_detail.Button(
                         weight=600,
                         link_name="dcim:device_frontports_add",
                         label="Front Ports",
-                        icon="mdi-square-rounded-outline",
+                        icon=DEVICE_COMPONENT_ICONS["frontport"],
                         required_permissions=["dcim.add_frontport"],
                     ),
                     object_detail.Button(
                         weight=700,
                         link_name="dcim:device_rearports_add",
                         label="Rear Ports",
-                        icon="mdi-square-rounded-outline",
+                        icon=DEVICE_COMPONENT_ICONS["rearport"],
                         required_permissions=["dcim.add_rearport"],
                     ),
                     object_detail.Button(
                         weight=800,
                         link_name="dcim:device_devicebays_add",
                         label="Device Bays",
-                        icon="mdi-circle-outline",
+                        icon=DEVICE_COMPONENT_ICONS["devicebay"],
                         required_permissions=["dcim.add_devicebay"],
                     ),
                     object_detail.Button(
                         weight=900,
                         link_name="dcim:device_modulebays_add",
                         label="Module Bays",
-                        icon="mdi-tray",
+                        icon=DEVICE_COMPONENT_ICONS["modulebay"],
                         required_permissions=["dcim.add_modulebay"],
                     ),
                     object_detail.Button(
                         weight=1000,
                         link_name="dcim:device_inventoryitems_add",
                         label="Inventory Items",
-                        icon="mdi-invoice-list-outline",
+                        icon=DEVICE_COMPONENT_ICONS["inventoryitem"],
                         required_permissions=["dcim.add_inventoryitem"],
                     ),
                 ),
@@ -3283,8 +3354,11 @@ class DeviceUIViewSet(NautobotUIViewSet):
                         table_class=tables.DeviceModuleInterfaceTable,
                         table_attribute="vc_interfaces",
                         order_by_fields=["_name"],
-                        prefetch_related_fields=["_path__destination"],
-                        select_related_fields=["cable", "lag"],
+                        select_related_fields=[*Interface.cable_columns_select_related_fields(), "lag"],
+                        # Unconditional prefetch (breakout-lane resolution for the always-on cable-status
+                        # row coloring); the `cable_peer` / `connection` column prefetches are applied
+                        # conditionally by the table itself when those columns are visible.
+                        prefetch_related_fields=Interface.cable_columns_prefetch_related_fields(),
                         related_field_name="device",
                         tab_id="interfaces",
                         enable_bulk_actions=True,
@@ -3311,7 +3385,7 @@ class DeviceUIViewSet(NautobotUIViewSet):
                         table_title="Front Ports",
                         table_class=tables.DeviceModuleFrontPortTable,
                         table_attribute="all_front_ports",
-                        select_related_fields=["cable", "rear_port"],
+                        select_related_fields=[*FrontPort.cable_columns_select_related_fields(), "rear_port"],
                         related_field_name="device",
                         tab_id="front_ports",
                         enable_bulk_actions=True,
@@ -3337,7 +3411,7 @@ class DeviceUIViewSet(NautobotUIViewSet):
                         table_title="Rear Ports",
                         table_class=tables.DeviceModuleRearPortTable,
                         table_attribute="all_rear_ports",
-                        select_related_fields=["cable"],
+                        select_related_fields=RearPort.cable_columns_select_related_fields(),
                         related_field_name="device",
                         tab_id="rear_ports",
                         enable_bulk_actions=True,
@@ -3361,8 +3435,7 @@ class DeviceUIViewSet(NautobotUIViewSet):
                         table_title="Console Ports",
                         table_class=tables.DeviceModuleConsolePortTable,
                         table_attribute="all_console_ports",
-                        select_related_fields=["cable"],
-                        prefetch_related_fields=["_path__destination"],
+                        select_related_fields=ConsolePort.cable_columns_select_related_fields(),
                         related_field_name="device",
                         tab_id="console_ports",
                         enable_bulk_actions=True,
@@ -3388,8 +3461,7 @@ class DeviceUIViewSet(NautobotUIViewSet):
                         table_title="Console Server Ports",
                         table_class=tables.DeviceModuleConsoleServerPortTable,
                         table_attribute="all_console_server_ports",
-                        select_related_fields=["cable"],
-                        prefetch_related_fields=["_path__destination"],
+                        select_related_fields=ConsoleServerPort.cable_columns_select_related_fields(),
                         related_field_name="device",
                         tab_id="console_server_ports",
                         enable_bulk_actions=True,
@@ -3415,8 +3487,7 @@ class DeviceUIViewSet(NautobotUIViewSet):
                         table_title="Power Ports",
                         table_class=tables.DeviceModulePowerPortTable,
                         table_attribute="all_power_ports",
-                        select_related_fields=["cable"],
-                        prefetch_related_fields=["_path__destination"],
+                        select_related_fields=PowerPort.cable_columns_select_related_fields(),
                         related_field_name="device",
                         tab_id="power_ports",
                         enable_bulk_actions=True,
@@ -3442,8 +3513,7 @@ class DeviceUIViewSet(NautobotUIViewSet):
                         table_title="Power Outlets",
                         table_class=tables.DeviceModulePowerOutletTable,
                         table_attribute="all_power_outlets",
-                        select_related_fields=["cable", "power_port"],
-                        prefetch_related_fields=["_path__destination"],
+                        select_related_fields=[*PowerOutlet.cable_columns_select_related_fields(), "power_port"],
                         related_field_name="device",
                         tab_id="power_outlets",
                         enable_bulk_actions=True,
@@ -3769,11 +3839,9 @@ class DeviceUIViewSet(NautobotUIViewSet):
     )
     def lldp_neighbors(self, request, *args, **kwargs):
         instance = self.get_object()
-        interfaces = (
+        interfaces = Interface.optimize_queryset_for_cable_columns(
             instance.all_interfaces.restrict(request.user, "view")
-            .prefetch_related("_path__destination")
-            .exclude(type__in=NONCONNECTABLE_IFACE_TYPES)
-        )
+        ).exclude(type__in=NONCONNECTABLE_IFACE_TYPES)
         return Response(
             {
                 "template": "dcim/device/lldp_neighbors.html",
@@ -3837,6 +3905,160 @@ class DeviceUIViewSet(NautobotUIViewSet):
 #
 
 
+class ComponentBulkDisconnectViewMixin(NautobotViewSetMixin):
+    """
+    UI mixin for UIViewSets serving cabled components (console/power/interface, etc.) — adds a
+    `bulk_disconnect` action that detaches each selected component from its cable via
+    `disconnect_termination()` (the cable itself and any other terminations are preserved).
+
+    Subclasses may set `bulk_disconnect_form_class` to override the default ConfirmationForm
+    with a hidden `pk` ModelMultipleChoiceField.
+    """
+
+    bulk_disconnect_form_class = None
+    bulk_disconnect_template_name = "dcim/bulk_disconnect.html"
+
+    def get_form_class(self, **kwargs):
+        """Provide a default ConfirmationForm if the consuming view didn't set one."""
+        form_class = super().get_form_class(**kwargs)
+        if not form_class and self.action == "bulk_disconnect":
+            queryset = self.get_queryset()
+
+            class BulkDisconnectForm(ConfirmationForm):
+                pk = ModelMultipleChoiceField(queryset=queryset, widget=MultipleHiddenInput)
+
+            return BulkDisconnectForm
+        return form_class
+
+    def _process_bulk_disconnect_form(self, form):
+        """Disconnect each selected component from its cable inside a single transaction.
+
+        Uses `disconnect_termination(obj)` to remove the termination only; the cable itself
+        and any surviving terminations are left intact. After the loop, the user is shown a
+        bulleted list of the now-orphaned cables so they can clean up any that are no longer
+        needed.
+
+        Permission enforcement:
+          - Per-component change perm is implicit in `self.get_queryset()` (restrict()).
+          - Per-cable change perm is verified inside the transaction by running the disconnected
+            cable PKs through `Cable.objects.restrict(user, "change")`; if any disconnected cable
+            falls outside that restricted set, `ObjectDoesNotExist` is raised, rolling back every
+            disconnect in the transaction.
+        """
+        request = self.request
+        queryset = self.get_queryset()
+        model = queryset.model
+
+        try:
+            with transaction.atomic():
+                count = 0
+                # Both collections are sets to dedupe when a single cable is hit by multiple
+                # selected terminations (both ends of a cable, or multiple terminations on a
+                # breakout cable): each unique cable should appear in the user message once,
+                # and the permission check below must compare against unique cable PKs.
+                disconnected_cables = set()
+                disconnected_cable_pks = set()
+                for obj in queryset.filter(pk__in=form.cleaned_data["pk"]):
+                    if obj.cable is None:
+                        continue
+                    cable_label = str(obj.cable)
+                    cable_url = obj.cable.get_absolute_url()
+                    disconnected_cable_pks.add(obj.cable_id)
+
+                    disconnect_termination(obj)
+
+                    disconnected_cables.add((cable_label, cable_url))
+                    count += 1
+
+                # Enforce object-level Cable change permission. The legacy `BulkDisconnectView`
+                # only checked the component's change perm even though it deleted the cable;
+                # this closes that gap. Raising `ObjectDoesNotExist` rolls back the transaction.
+                if Cable.objects.restrict(request.user, "change").filter(pk__in=disconnected_cable_pks).count() != len(
+                    disconnected_cable_pks
+                ):
+                    raise ObjectDoesNotExist
+
+            msg = f"Disconnected {count} {model._meta.verbose_name_plural}"
+            logger.info(msg)
+            self.success_url = self.get_return_url(request)
+            messages.success(request, msg)
+            # Inform the user that the surviving cables can still be cleaned up. One
+            # aggregated message with a bullet list, not one toast per cable.
+            if disconnected_cables:
+                cable_items = format_html_join(
+                    "",
+                    '<li><a href="{}">{}</a> (<a href="{}delete/">delete</a>)</li>',
+                    ((cable_url, cable_label, cable_url) for cable_label, cable_url in disconnected_cables),
+                )
+                messages.info(
+                    request,
+                    format_html(
+                        "The following cables still exist — delete any that are no longer needed:<ul>{}</ul>",
+                        cable_items,
+                    ),
+                )
+        except ObjectDoesNotExist:
+            msg = "Bulk disconnect failed due to object-level permissions violation on one or more cables"
+            logger.info(msg)
+            messages.error(request, msg)
+            self.success_url = self.get_return_url(request)
+        except ProtectedError as e:  # pragma: no cover
+            logger.info("Caught ProtectedError while attempting to disconnect cables")
+            handle_protectederror(queryset, request, e)
+            self.success_url = self.get_return_url(request)
+
+    @action(
+        detail=False,
+        methods=["post"],
+        url_path="disconnect",
+        url_name="bulk_disconnect",
+        custom_view_base_action="change",
+        custom_view_additional_permissions=["dcim.change_cable"],
+    )
+    def bulk_disconnect(self, request, *args, **kwargs):
+        """Mirrors DRF's `{action}/perform_{action}` pattern used by the other bulk mixins."""
+        return self.perform_bulk_disconnect(request, **kwargs)
+
+    def perform_bulk_disconnect(self, request, **kwargs):
+        """
+        POST without `_confirm`: render the confirmation page listing the selected components.
+        POST with `_confirm`: validate the form and detach each component from its cable.
+        When `_confirm` is present but the form is invalid (e.g. no `pk` submitted), each error
+        is surfaced as a flash message before the confirmation page is re-rendered, since the
+        underlying `confirmation_form.html` template hides the `pk` field and won't otherwise
+        display its errors.
+        """
+        queryset = self.get_queryset()
+        model = queryset.model
+        self.pk_list = list(request.POST.getlist("pk"))
+
+        form_class = self.get_form_class(**kwargs)
+
+        if "_confirm" in request.POST:
+            form = form_class(request.POST, initial=normalize_querydict(request.GET, form_class=form_class))
+            if form.is_valid():
+                self._process_bulk_disconnect_form(form)
+                return redirect(self.get_return_url(request))
+            for field_name, errors in form.errors.items():
+                for error in errors:
+                    label = "" if field_name == "__all__" else f"{field_name}: "
+                    messages.error(request, f"{label}{error}")
+        else:
+            form = form_class(initial={"pk": self.pk_list})
+
+        selected_objects = queryset.filter(pk__in=self.pk_list)
+
+        return Response(
+            {
+                "form": form,
+                "obj_type_plural": model._meta.verbose_name_plural,
+                "selected_objects": selected_objects,
+                "return_url": self.get_return_url(request),
+                "template": self.bulk_disconnect_template_name,
+            }
+        )
+
+
 class BulkComponentCreateUIViewSetMixin:
     def _bulk_component_create(self, request, component_queryset, bulk_component_form, parent_field=None):
         parent_model_name = self.queryset.model._meta.verbose_name_plural
@@ -3893,10 +4115,11 @@ class BulkComponentCreateUIViewSetMixin:
                                     ) in component_form.errors.as_data().items():
                                         for e in errors:
                                             err_str = ", ".join(e)
-                                            form.add_error(
-                                                field,
-                                                f"{obj} {name}: {err_str}",
-                                            )
+                                            if field not in form.fields:
+                                                # Add generic errors for fields of the model form that are not declared in the create form.
+                                                form.add_error(None, f"{obj} {name}: {field}: {err_str}")
+                                            else:
+                                                form.add_error(field, f"{obj} {name}: {err_str}")
 
                         # Enforce object-level permissions
                         if component_queryset.filter(pk__in=[obj.pk for obj in new_components]).count() != len(
@@ -4005,10 +4228,8 @@ class ModuleUIViewSet(BulkComponentCreateUIViewSetMixin, NautobotUIViewSet):
     )
     def consoleports(self, request, *args, **kwargs):
         instance = self.get_object()
-        consoleports = (
+        consoleports = ConsolePort.optimize_queryset_for_cable_columns(
             instance.console_ports.restrict(request.user, "view")
-            .select_related("cable")
-            .prefetch_related("_path__destination")
         )
         consoleport_table = tables.DeviceModuleConsolePortTable(
             data=consoleports, user=request.user, configurable=True, orderable=False
@@ -4032,10 +4253,8 @@ class ModuleUIViewSet(BulkComponentCreateUIViewSetMixin, NautobotUIViewSet):
     )
     def consoleserverports(self, request, *args, **kwargs):
         instance = self.get_object()
-        consoleserverports = (
+        consoleserverports = ConsoleServerPort.optimize_queryset_for_cable_columns(
             instance.console_server_ports.restrict(request.user, "view")
-            .select_related("cable")
-            .prefetch_related("_path__destination")
         )
         consoleserverport_table = tables.DeviceModuleConsoleServerPortTable(
             data=consoleserverports, user=request.user, orderable=False, configurable=True, parent_module=instance
@@ -4061,11 +4280,7 @@ class ModuleUIViewSet(BulkComponentCreateUIViewSetMixin, NautobotUIViewSet):
     )
     def powerports(self, request, *args, **kwargs):
         instance = self.get_object()
-        powerports = (
-            instance.power_ports.restrict(request.user, "view")
-            .select_related("cable")
-            .prefetch_related("_path__destination")
-        )
+        powerports = PowerPort.optimize_queryset_for_cable_columns(instance.power_ports.restrict(request.user, "view"))
         powerport_table = tables.DeviceModulePowerPortTable(
             data=powerports, user=request.user, orderable=False, configurable=True, parent_module=instance
         )
@@ -4088,11 +4303,9 @@ class ModuleUIViewSet(BulkComponentCreateUIViewSetMixin, NautobotUIViewSet):
     )
     def poweroutlets(self, request, *args, **kwargs):
         instance = self.get_object()
-        poweroutlets = (
+        poweroutlets = PowerOutlet.optimize_queryset_for_cable_columns(
             instance.power_outlets.restrict(request.user, "view")
-            .select_related("cable", "power_port")
-            .prefetch_related("_path__destination")
-        )
+        ).select_related("power_port")
         poweroutlet_table = tables.DeviceModulePowerOutletTable(
             data=poweroutlets, user=request.user, orderable=False, configurable=True, parent_module=instance
         )
@@ -4115,14 +4328,13 @@ class ModuleUIViewSet(BulkComponentCreateUIViewSetMixin, NautobotUIViewSet):
     def interfaces(self, request, *args, **kwargs):
         instance = self.get_object()
         interfaces = (
-            instance.interfaces.restrict(request.user, "view")
+            Interface.optimize_queryset_for_cable_columns(instance.interfaces.restrict(request.user, "view"))
             .prefetch_related(
                 Prefetch("ip_addresses", queryset=IPAddress.objects.restrict(request.user)),
                 Prefetch("member_interfaces", queryset=Interface.objects.restrict(request.user)),
-                "_path__destination",
                 "tags",
             )
-            .select_related("lag", "cable")
+            .select_related("lag")
         )
         interface_table = tables.DeviceModuleInterfaceTable(
             data=interfaces, user=request.user, orderable=False, configurable=True, parent_module=instance
@@ -4146,7 +4358,9 @@ class ModuleUIViewSet(BulkComponentCreateUIViewSetMixin, NautobotUIViewSet):
     )
     def frontports(self, request, *args, **kwargs):
         instance = self.get_object()
-        frontports = instance.front_ports.restrict(request.user, "view").select_related("cable", "rear_port")
+        frontports = FrontPort.optimize_queryset_for_cable_columns(
+            instance.front_ports.restrict(request.user, "view")
+        ).select_related("rear_port")
         frontport_table = tables.DeviceModuleFrontPortTable(
             data=frontports, user=request.user, orderable=False, configurable=True, parent_module=instance
         )
@@ -4169,7 +4383,7 @@ class ModuleUIViewSet(BulkComponentCreateUIViewSetMixin, NautobotUIViewSet):
     )
     def rearports(self, request, *args, **kwargs):
         instance = self.get_object()
-        rearports = instance.rear_ports.restrict(request.user, "view").select_related("cable")
+        rearports = RearPort.optimize_queryset_for_cable_columns(instance.rear_ports.restrict(request.user, "view"))
         rearport_table = tables.DeviceModuleRearPortTable(
             data=rearports, user=request.user, orderable=False, configurable=True, parent_module=instance
         )
@@ -4327,67 +4541,41 @@ class ModuleUIViewSet(BulkComponentCreateUIViewSetMixin, NautobotUIViewSet):
 #
 
 
-class ConsolePortListView(generic.ObjectListView):
-    queryset = ConsolePort.objects.all()
-    filterset = filters.ConsolePortFilterSet
-    filterset_form = forms.ConsolePortFilterForm
-    table = tables.ConsolePortTable
+class ConsolePortUIViewSet(
+    DeviceComponentPageMixin,
+    ComponentCreateViewMixin,
+    ComponentBulkDisconnectViewMixin,
+    NautobotUIViewSet,
+):
+    queryset = ConsolePort.optimize_queryset_for_cable_columns(ConsolePort.objects.all())
+    bulk_update_form_class = forms.ConsolePortBulkEditForm
+    create_form_class = forms.ConsolePortCreateForm
+    filterset_class = filters.ConsolePortFilterSet
+    filterset_form_class = forms.ConsolePortFilterForm
+    form_class = forms.ConsolePortForm
+    serializer_class = serializers.ConsolePortSerializer
+    table_class = tables.ConsolePortTable
     action_buttons = ("import", "export")
-
-
-class ConsolePortView(DeviceComponentPageMixin, generic.ObjectView):
-    queryset = ConsolePort.objects.all()
     device_breadcrumb_url = "dcim:device_consoleports"
     module_breadcrumb_url = "dcim:module_consoleports"
 
-    def get_extra_context(self, request, instance):
-        return {
-            "device_breadcrumb_url": self.device_breadcrumb_url,
-            "module_breadcrumb_url": self.module_breadcrumb_url,
-            **super().get_extra_context(request, instance),
-        }
-
-
-class ConsolePortCreateView(generic.ComponentCreateView):
-    queryset = ConsolePort.objects.all()
-    form = forms.ConsolePortCreateForm
-    model_form = forms.ConsolePortForm
-
-
-class ConsolePortEditView(generic.ObjectEditView):
-    queryset = ConsolePort.objects.all()
-    model_form = forms.ConsolePortForm
-    template_name = "dcim/device_component_edit.html"
-
-
-class ConsolePortDeleteView(generic.ObjectDeleteView):
-    queryset = ConsolePort.objects.all()
-
-
-class ConsolePortBulkImportView(generic.BulkImportView):  # 3.0 TODO: remove, unused
-    queryset = ConsolePort.objects.all()
-    table = tables.ConsolePortTable
-
-
-class ConsolePortBulkEditView(generic.BulkEditView):
-    queryset = ConsolePort.objects.all()
-    filterset = filters.ConsolePortFilterSet
-    table = tables.ConsolePortTable
-    form = forms.ConsolePortBulkEditForm
-
-
-class ConsolePortBulkRenameView(BaseDeviceComponentsBulkRenameView):
-    queryset = ConsolePort.objects.all()
-
-
-class ConsolePortBulkDisconnectView(BulkDisconnectView):
-    queryset = ConsolePort.objects.all()
-
-
-class ConsolePortBulkDeleteView(generic.BulkDeleteView):
-    queryset = ConsolePort.objects.all()
-    filterset = filters.ConsolePortFilterSet
-    table = tables.ConsolePortTable
+    object_detail_content = object_detail.ObjectDetailContent(
+        panels=(
+            object_detail.ObjectFieldsPanel(
+                section=SectionChoices.LEFT_HALF,
+                weight=100,
+                label="Console Port",
+                exclude_fields=("cable_termination",),
+                hide_if_unset=("device", "module"),
+            ),
+            object_detail.ConnectionPanel(
+                section=SectionChoices.RIGHT_HALF,
+                weight=100,
+                trace_url_name="dcim:consoleport_trace",
+            ),
+            *get_connected_endpoint_panels("consoleport"),
+        )
+    )
 
 
 #
@@ -4395,67 +4583,41 @@ class ConsolePortBulkDeleteView(generic.BulkDeleteView):
 #
 
 
-class ConsoleServerPortListView(generic.ObjectListView):
-    queryset = ConsoleServerPort.objects.all()
-    filterset = filters.ConsoleServerPortFilterSet
-    filterset_form = forms.ConsoleServerPortFilterForm
-    table = tables.ConsoleServerPortTable
+class ConsoleServerPortUIViewSet(
+    DeviceComponentPageMixin,
+    ComponentCreateViewMixin,
+    ComponentBulkDisconnectViewMixin,
+    NautobotUIViewSet,
+):
+    queryset = ConsoleServerPort.optimize_queryset_for_cable_columns(ConsoleServerPort.objects.all())
+    bulk_update_form_class = forms.ConsoleServerPortBulkEditForm
+    create_form_class = forms.ConsoleServerPortCreateForm
+    filterset_class = filters.ConsoleServerPortFilterSet
+    filterset_form_class = forms.ConsoleServerPortFilterForm
+    form_class = forms.ConsoleServerPortForm
+    serializer_class = serializers.ConsoleServerPortSerializer
+    table_class = tables.ConsoleServerPortTable
     action_buttons = ("import", "export")
-
-
-class ConsoleServerPortView(DeviceComponentPageMixin, generic.ObjectView):
-    queryset = ConsoleServerPort.objects.all()
     device_breadcrumb_url = "dcim:device_consoleserverports"
     module_breadcrumb_url = "dcim:module_consoleserverports"
 
-    def get_extra_context(self, request, instance):
-        return {
-            "device_breadcrumb_url": self.device_breadcrumb_url,
-            "module_breadcrumb_url": self.module_breadcrumb_url,
-            **super().get_extra_context(request, instance),
-        }
-
-
-class ConsoleServerPortCreateView(generic.ComponentCreateView):
-    queryset = ConsoleServerPort.objects.all()
-    form = forms.ConsoleServerPortCreateForm
-    model_form = forms.ConsoleServerPortForm
-
-
-class ConsoleServerPortEditView(generic.ObjectEditView):
-    queryset = ConsoleServerPort.objects.all()
-    model_form = forms.ConsoleServerPortForm
-    template_name = "dcim/device_component_edit.html"
-
-
-class ConsoleServerPortDeleteView(generic.ObjectDeleteView):
-    queryset = ConsoleServerPort.objects.all()
-
-
-class ConsoleServerPortBulkImportView(generic.BulkImportView):  # 3.0 TODO: remove, unused
-    queryset = ConsoleServerPort.objects.all()
-    table = tables.ConsoleServerPortTable
-
-
-class ConsoleServerPortBulkEditView(generic.BulkEditView):
-    queryset = ConsoleServerPort.objects.all()
-    filterset = filters.ConsoleServerPortFilterSet
-    table = tables.ConsoleServerPortTable
-    form = forms.ConsoleServerPortBulkEditForm
-
-
-class ConsoleServerPortBulkRenameView(BaseDeviceComponentsBulkRenameView):
-    queryset = ConsoleServerPort.objects.all()
-
-
-class ConsoleServerPortBulkDisconnectView(BulkDisconnectView):
-    queryset = ConsoleServerPort.objects.all()
-
-
-class ConsoleServerPortBulkDeleteView(generic.BulkDeleteView):
-    queryset = ConsoleServerPort.objects.all()
-    filterset = filters.ConsoleServerPortFilterSet
-    table = tables.ConsoleServerPortTable
+    object_detail_content = object_detail.ObjectDetailContent(
+        panels=(
+            object_detail.ObjectFieldsPanel(
+                section=SectionChoices.LEFT_HALF,
+                weight=100,
+                label="Console Server Port",
+                exclude_fields=("cable_termination",),
+                hide_if_unset=("device", "module"),
+            ),
+            object_detail.ConnectionPanel(
+                section=SectionChoices.RIGHT_HALF,
+                weight=100,
+                trace_url_name="dcim:consoleserverport_trace",
+            ),
+            *get_connected_endpoint_panels("consoleserverport"),
+        )
+    )
 
 
 #
@@ -4463,67 +4625,40 @@ class ConsoleServerPortBulkDeleteView(generic.BulkDeleteView):
 #
 
 
-class PowerPortListView(generic.ObjectListView):
-    queryset = PowerPort.objects.all()
-    filterset = filters.PowerPortFilterSet
-    filterset_form = forms.PowerPortFilterForm
-    table = tables.PowerPortTable
+class PowerPortUIViewSet(
+    DeviceComponentPageMixin,
+    ComponentCreateViewMixin,
+    ComponentBulkDisconnectViewMixin,
+    NautobotUIViewSet,
+):
+    queryset = PowerPort.optimize_queryset_for_cable_columns(PowerPort.objects.all())
+    bulk_update_form_class = forms.PowerPortBulkEditForm
+    create_form_class = forms.PowerPortCreateForm
+    filterset_class = filters.PowerPortFilterSet
+    filterset_form_class = forms.PowerPortFilterForm
+    form_class = forms.PowerPortForm
+    serializer_class = serializers.PowerPortSerializer
+    table_class = tables.PowerPortTable
     action_buttons = ("import", "export")
-
-
-class PowerPortView(DeviceComponentPageMixin, generic.ObjectView):
-    queryset = PowerPort.objects.all()
     device_breadcrumb_url = "dcim:device_powerports"
     module_breadcrumb_url = "dcim:module_powerports"
 
-    def get_extra_context(self, request, instance):
-        return {
-            "device_breadcrumb_url": self.device_breadcrumb_url,
-            "module_breadcrumb_url": self.module_breadcrumb_url,
-            **super().get_extra_context(request, instance),
-        }
-
-
-class PowerPortCreateView(generic.ComponentCreateView):
-    queryset = PowerPort.objects.all()
-    form = forms.PowerPortCreateForm
-    model_form = forms.PowerPortForm
-
-
-class PowerPortEditView(generic.ObjectEditView):
-    queryset = PowerPort.objects.all()
-    model_form = forms.PowerPortForm
-    template_name = "dcim/device_component_edit.html"
-
-
-class PowerPortDeleteView(generic.ObjectDeleteView):
-    queryset = PowerPort.objects.all()
-
-
-class PowerPortBulkImportView(generic.BulkImportView):  # 3.0 TODO: remove, unused
-    queryset = PowerPort.objects.all()
-    table = tables.PowerPortTable
-
-
-class PowerPortBulkEditView(generic.BulkEditView):
-    queryset = PowerPort.objects.all()
-    filterset = filters.PowerPortFilterSet
-    table = tables.PowerPortTable
-    form = forms.PowerPortBulkEditForm
-
-
-class PowerPortBulkRenameView(BaseDeviceComponentsBulkRenameView):
-    queryset = PowerPort.objects.all()
-
-
-class PowerPortBulkDisconnectView(BulkDisconnectView):
-    queryset = PowerPort.objects.all()
-
-
-class PowerPortBulkDeleteView(generic.BulkDeleteView):
-    queryset = PowerPort.objects.all()
-    filterset = filters.PowerPortFilterSet
-    table = tables.PowerPortTable
+    object_detail_content = object_detail.ObjectDetailContent(
+        panels=(
+            object_detail.ObjectFieldsPanel(
+                weight=100,
+                section=SectionChoices.LEFT_HALF,
+                exclude_fields=("cable_termination"),
+                hide_if_unset=("device", "module"),
+            ),
+            object_detail.ConnectionPanel(
+                section=SectionChoices.RIGHT_HALF,
+                weight=100,
+                trace_url_name="dcim:powerport_trace",
+            ),
+            *get_connected_endpoint_panels("powerport"),
+        )
+    )
 
 
 #
@@ -4531,67 +4666,40 @@ class PowerPortBulkDeleteView(generic.BulkDeleteView):
 #
 
 
-class PowerOutletListView(generic.ObjectListView):
-    queryset = PowerOutlet.objects.all()
-    filterset = filters.PowerOutletFilterSet
-    filterset_form = forms.PowerOutletFilterForm
-    table = tables.PowerOutletTable
+class PowerOutletUIViewSet(
+    DeviceComponentPageMixin,
+    ComponentCreateViewMixin,
+    ComponentBulkDisconnectViewMixin,
+    NautobotUIViewSet,
+):
+    queryset = PowerOutlet.optimize_queryset_for_cable_columns(PowerOutlet.objects.all())
+    bulk_update_form_class = forms.PowerOutletBulkEditForm
+    create_form_class = forms.PowerOutletCreateForm
+    filterset_class = filters.PowerOutletFilterSet
+    filterset_form_class = forms.PowerOutletFilterForm
+    form_class = forms.PowerOutletForm
+    serializer_class = serializers.PowerOutletSerializer
+    table_class = tables.PowerOutletTable
     action_buttons = ("import", "export")
-
-
-class PowerOutletView(DeviceComponentPageMixin, generic.ObjectView):
-    queryset = PowerOutlet.objects.all()
     device_breadcrumb_url = "dcim:device_poweroutlets"
     module_breadcrumb_url = "dcim:module_poweroutlets"
 
-    def get_extra_context(self, request, instance):
-        return {
-            "device_breadcrumb_url": self.device_breadcrumb_url,
-            "module_breadcrumb_url": self.module_breadcrumb_url,
-            **super().get_extra_context(request, instance),
-        }
-
-
-class PowerOutletCreateView(generic.ComponentCreateView):
-    queryset = PowerOutlet.objects.all()
-    form = forms.PowerOutletCreateForm
-    model_form = forms.PowerOutletForm
-
-
-class PowerOutletEditView(generic.ObjectEditView):
-    queryset = PowerOutlet.objects.all()
-    model_form = forms.PowerOutletForm
-    template_name = "dcim/device_component_edit.html"
-
-
-class PowerOutletDeleteView(generic.ObjectDeleteView):
-    queryset = PowerOutlet.objects.all()
-
-
-class PowerOutletBulkImportView(generic.BulkImportView):  # 3.0 TODO: remove, unused
-    queryset = PowerOutlet.objects.all()
-    table = tables.PowerOutletTable
-
-
-class PowerOutletBulkEditView(generic.BulkEditView):
-    queryset = PowerOutlet.objects.all()
-    filterset = filters.PowerOutletFilterSet
-    table = tables.PowerOutletTable
-    form = forms.PowerOutletBulkEditForm
-
-
-class PowerOutletBulkRenameView(BaseDeviceComponentsBulkRenameView):
-    queryset = PowerOutlet.objects.all()
-
-
-class PowerOutletBulkDisconnectView(BulkDisconnectView):
-    queryset = PowerOutlet.objects.all()
-
-
-class PowerOutletBulkDeleteView(generic.BulkDeleteView):
-    queryset = PowerOutlet.objects.all()
-    filterset = filters.PowerOutletFilterSet
-    table = tables.PowerOutletTable
+    object_detail_content = object_detail.ObjectDetailContent(
+        panels=(
+            object_detail.ObjectFieldsPanel(
+                weight=100,
+                section=SectionChoices.LEFT_HALF,
+                exclude_fields=("cable_termination",),
+                hide_if_unset=("device", "module"),
+            ),
+            object_detail.ConnectionPanel(
+                section=SectionChoices.RIGHT_HALF,
+                weight=100,
+                trace_url_name="dcim:poweroutlet_trace",
+            ),
+            *get_connected_endpoint_panels("poweroutlet"),
+        )
+    )
 
 
 #
@@ -4599,68 +4707,79 @@ class PowerOutletBulkDeleteView(generic.BulkDeleteView):
 #
 
 
-class InterfaceListView(generic.ObjectListView):
-    queryset = Interface.objects.all()
-    filterset = filters.InterfaceFilterSet
-    filterset_form = forms.InterfaceFilterForm
-    table = tables.InterfaceTable
-    action_buttons = ("import", "export")
-
-
-class InterfaceView(
+class InterfaceUIViewSet(
     DeviceComponentPageMixin,
-    generic.ObjectView,
+    ComponentCreateViewMixin,
+    ComponentBulkDisconnectViewMixin,
+    NautobotUIViewSet,
 ):
-    queryset = Interface.objects.all()
+    # `optimize_queryset_for_cable_columns` adds the `select_related` / `prefetch_related` needed
+    # so `cable`, `cable_peer`, and `connection` columns don't trigger per-row N+1 queries against
+    # CableToCableTermination / CablePath.
+    queryset = Interface.optimize_queryset_for_cable_columns(Interface.objects.all())
+    bulk_update_form_class = forms.InterfaceBulkEditForm
+    create_form_class = forms.InterfaceCreateForm
+    filterset_class = filters.InterfaceFilterSet
+    filterset_form_class = forms.InterfaceFilterForm
+    form_class = forms.InterfaceForm
+    serializer_class = serializers.InterfaceSerializer
+    table_class = tables.InterfaceTable
+    action_buttons = ("import", "export")
     device_breadcrumb_url = "dcim:device_interfaces"
     module_breadcrumb_url = "dcim:module_interfaces"
 
-    def get_extra_context(self, request, instance):
-        # Get assigned IP addresses
-        ipaddress_table = InterfaceIPAddressTable(
-            # data=instance.ip_addresses.restrict(request.user, "view").select_related("vrf", "tenant"),
-            data=instance.ip_addresses.restrict(request.user, "view").select_related("tenant"),
-            orderable=False,
-        )
+    def get_extra_context(self, request, instance=None):
+        context = super().get_extra_context(request, instance)
+        if self.action == "retrieve":
+            # Get assigned IP addresses
+            ipaddress_table = InterfaceIPAddressTable(
+                # data=instance.ip_addresses.restrict(request.user, "view").select_related("vrf", "tenant"),
+                data=instance.ip_addresses.restrict(request.user, "view").select_related("tenant"),
+                orderable=False,
+            )
 
-        # Get child interfaces
-        child_interfaces = instance.child_interfaces.restrict(request.user, "view")
-        child_interfaces_tables = tables.InterfaceTable(child_interfaces, orderable=False, exclude=("device",))
+            # Get child interfaces
+            child_interfaces = instance.child_interfaces.restrict(request.user, "view")
+            child_interfaces_tables = tables.InterfaceTable(child_interfaces, orderable=False, exclude=("device",))
 
-        # Get assigned VLANs and annotate whether each is tagged or untagged
-        vlans = []
-        if instance.untagged_vlan is not None:
-            vlans.append(instance.untagged_vlan)
-            vlans[0].tagged = False
+            # Get assigned VLANs and annotate whether each is tagged or untagged
+            vlans = []
+            # Restrict `untagged_vlan` (a single FK) the same way `tagged_vlans` is restricted below,
+            # so a user without view permission on that VLAN doesn't see it in the table.
+            if instance.untagged_vlan_id is not None:
+                untagged_vlan = VLAN.objects.restrict(request.user, "view").filter(pk=instance.untagged_vlan_id).first()
+                if untagged_vlan is not None:
+                    untagged_vlan.tagged = False
+                    vlans.append(untagged_vlan)
 
-        for vlan in (
-            instance.tagged_vlans.restrict(request.user)
-            .annotate(location_count=count_related(Location, "vlans"))
-            .select_related("vlan_group", "tenant", "role")
-        ):
-            vlan.tagged = True
-            vlans.append(vlan)
-        vlan_table = InterfaceVLANTable(interface=instance, data=vlans, orderable=False)
+            for vlan in (
+                instance.tagged_vlans.restrict(request.user)
+                .annotate(location_count=count_related(Location, "vlans"))
+                .select_related("vlan_group", "tenant", "role")
+            ):
+                vlan.tagged = True
+                vlans.append(vlan)
+            vlan_table = InterfaceVLANTable(interface=instance, data=vlans, orderable=False)
 
-        redundancy_table = self._get_interface_redundancy_groups_table(request, instance)
-        virtual_device_contexts_table = tables.VirtualDeviceContextTable(
-            instance.virtual_device_contexts.restrict(request.user, "view").select_related(
-                "device", "tenant", "primary_ip4", "primary_ip6"
-            ),
-            orderable=False,
-            exclude=("device",),
-        )
-
-        return {
-            "ipaddress_table": ipaddress_table,
-            "vlan_table": vlan_table,
-            "device_breadcrumb_url": self.device_breadcrumb_url,
-            "module_breadcrumb_url": self.module_breadcrumb_url,
-            "child_interfaces_table": child_interfaces_tables,
-            "redundancy_table": redundancy_table,
-            "virtual_device_contexts_table": virtual_device_contexts_table,
-            **super().get_extra_context(request, instance),
-        }
+            redundancy_table = self._get_interface_redundancy_groups_table(request, instance)
+            virtual_device_contexts_table = tables.VirtualDeviceContextTable(
+                instance.virtual_device_contexts.restrict(request.user, "view").select_related(
+                    "device", "tenant", "primary_ip4", "primary_ip6"
+                ),
+                orderable=False,
+                exclude=("device",),
+            )
+            context.update(
+                {
+                    "ipaddress_table": ipaddress_table,
+                    "vlan_table": vlan_table,
+                    "child_interfaces_table": child_interfaces_tables,
+                    "redundancy_table": redundancy_table,
+                    "virtual_device_contexts_table": virtual_device_contexts_table,
+                    "connected_endpoint_tables": get_connected_endpoint_tables(instance),
+                }
+            )
+        return context
 
     def _get_interface_redundancy_groups_table(self, request, instance):
         """Return a table of assigned Interface Redundancy Groups."""
@@ -4685,116 +4804,44 @@ class InterfaceView(
         return table
 
 
-class InterfaceCreateView(generic.ComponentCreateView):
-    queryset = Interface.objects.all()
-    form = forms.InterfaceCreateForm
-    model_form = forms.InterfaceForm
-
-
-class InterfaceEditView(generic.ObjectEditView):
-    queryset = Interface.objects.all()
-    model_form = forms.InterfaceForm
-    template_name = "dcim/interface_edit.html"
-
-
-class InterfaceDeleteView(generic.ObjectDeleteView):
-    queryset = Interface.objects.all()
-    template_name = "dcim/device_interface_delete.html"
-
-
-class InterfaceBulkImportView(generic.BulkImportView):  # 3.0 TODO: remove, unused
-    queryset = Interface.objects.all()
-    table = tables.InterfaceTable
-
-
-class InterfaceBulkEditView(generic.BulkEditView):
-    queryset = Interface.objects.all()
-    filterset = filters.InterfaceFilterSet
-    table = tables.InterfaceTable
-    form = forms.InterfaceBulkEditForm
-
-
-class InterfaceBulkRenameView(BaseDeviceComponentsBulkRenameView):
-    queryset = Interface.objects.all()
-
-
-class InterfaceBulkDisconnectView(BulkDisconnectView):
-    queryset = Interface.objects.all()
-
-
-class InterfaceBulkDeleteView(generic.BulkDeleteView):
-    queryset = Interface.objects.all()
-    filterset = filters.InterfaceFilterSet
-    table = tables.InterfaceTable
-    template_name = "dcim/interface_bulk_delete.html"
-
-
 #
 # Front ports
 #
 
 
-class FrontPortListView(generic.ObjectListView):
-    queryset = FrontPort.objects.all()
-    filterset = filters.FrontPortFilterSet
-    filterset_form = forms.FrontPortFilterForm
-    table = tables.FrontPortTable
+class FrontPortUIViewSet(
+    DeviceComponentPageMixin,
+    ComponentCreateViewMixin,
+    ComponentBulkDisconnectViewMixin,
+    NautobotUIViewSet,
+):
+    queryset = FrontPort.optimize_queryset_for_cable_columns(FrontPort.objects.all())
+    filterset_class = filters.FrontPortFilterSet
+    filterset_form_class = forms.FrontPortFilterForm
+    form_class = forms.FrontPortForm
+    create_form_class = forms.FrontPortCreateForm
+    bulk_update_form_class = forms.FrontPortBulkEditForm
+    serializer_class = serializers.FrontPortSerializer
+    table_class = tables.FrontPortTable
     action_buttons = ("import", "export")
-
-
-class FrontPortView(DeviceComponentPageMixin, generic.ObjectView):
-    queryset = FrontPort.objects.all()
     device_breadcrumb_url = "dcim:device_frontports"
     module_breadcrumb_url = "dcim:module_frontports"
 
-    def get_extra_context(self, request, instance):
-        return {
-            "device_breadcrumb_url": self.device_breadcrumb_url,
-            "module_breadcrumb_url": self.module_breadcrumb_url,
-            **super().get_extra_context(request, instance),
-        }
-
-
-class FrontPortCreateView(generic.ComponentCreateView):
-    queryset = FrontPort.objects.all()
-    form = forms.FrontPortCreateForm
-    model_form = forms.FrontPortForm
-
-
-class FrontPortEditView(generic.ObjectEditView):
-    queryset = FrontPort.objects.all()
-    model_form = forms.FrontPortForm
-    template_name = "dcim/device_component_edit.html"
-
-
-class FrontPortDeleteView(generic.ObjectDeleteView):
-    queryset = FrontPort.objects.all()
-
-
-class FrontPortBulkImportView(generic.BulkImportView):  # 3.0 TODO: remove, unused
-    queryset = FrontPort.objects.all()
-    table = tables.FrontPortTable
-
-
-class FrontPortBulkEditView(generic.BulkEditView):
-    queryset = FrontPort.objects.all()
-    filterset = filters.FrontPortFilterSet
-    table = tables.FrontPortTable
-    form = forms.FrontPortBulkEditForm
-
-
-class FrontPortBulkRenameView(BaseDeviceComponentsBulkRenameView):
-    queryset = FrontPort.objects.all()
-
-
-class FrontPortBulkDisconnectView(BulkDisconnectView):
-    queryset = FrontPort.objects.all()
-
-
-class FrontPortBulkDeleteView(generic.BulkDeleteView):
-    queryset = FrontPort.objects.all()
-    filterset = filters.FrontPortFilterSet
-    table = tables.FrontPortTable
+    object_detail_content = object_detail.ObjectDetailContent(
+        panels=(
+            object_detail.ObjectFieldsPanel(
+                section=SectionChoices.LEFT_HALF,
+                weight=100,
+                exclude_fields=("cable_termination",),
+                hide_if_unset=("device", "module"),
+            ),
+            object_detail.ConnectionPanel(
+                section=SectionChoices.RIGHT_HALF,
+                weight=100,
+                trace_url_name="dcim:frontport_trace",
+            ),
+        )
+    )
 
 
 #
@@ -4802,67 +4849,46 @@ class FrontPortBulkDeleteView(generic.BulkDeleteView):
 #
 
 
-class RearPortListView(generic.ObjectListView):
-    queryset = RearPort.objects.all()
-    filterset = filters.RearPortFilterSet
-    filterset_form = forms.RearPortFilterForm
-    table = tables.RearPortTable
+class RearPortUIViewSet(
+    DeviceComponentPageMixin,
+    ComponentCreateViewMixin,
+    ComponentBulkDisconnectViewMixin,
+    NautobotUIViewSet,
+):
+    queryset = RearPort.optimize_queryset_for_cable_columns(RearPort.objects.all())
+    bulk_update_form_class = forms.RearPortBulkEditForm
+    create_form_class = forms.RearPortCreateForm
+    filterset_class = filters.RearPortFilterSet
+    filterset_form_class = forms.RearPortFilterForm
+    form_class = forms.RearPortForm
+    serializer_class = serializers.RearPortSerializer
+    table_class = tables.RearPortTable
     action_buttons = ("import", "export")
-
-
-class RearPortView(DeviceComponentPageMixin, generic.ObjectView):
-    queryset = RearPort.objects.all()
     device_breadcrumb_url = "dcim:device_rearports"
     module_breadcrumb_url = "dcim:module_rearports"
-
-    def get_extra_context(self, request, instance):
-        return {
-            "device_breadcrumb_url": self.device_breadcrumb_url,
-            "module_breadcrumb_url": self.module_breadcrumb_url,
-            **super().get_extra_context(request, instance),
-        }
-
-
-class RearPortCreateView(generic.ComponentCreateView):
-    queryset = RearPort.objects.all()
-    form = forms.RearPortCreateForm
-    model_form = forms.RearPortForm
-
-
-class RearPortEditView(generic.ObjectEditView):
-    queryset = RearPort.objects.all()
-    model_form = forms.RearPortForm
-    template_name = "dcim/device_component_edit.html"
-
-
-class RearPortDeleteView(generic.ObjectDeleteView):
-    queryset = RearPort.objects.all()
-
-
-class RearPortBulkImportView(generic.BulkImportView):  # 3.0 TODO: remove, unused
-    queryset = RearPort.objects.all()
-    table = tables.RearPortTable
-
-
-class RearPortBulkEditView(generic.BulkEditView):
-    queryset = RearPort.objects.all()
-    filterset = filters.RearPortFilterSet
-    table = tables.RearPortTable
-    form = forms.RearPortBulkEditForm
-
-
-class RearPortBulkRenameView(BaseDeviceComponentsBulkRenameView):
-    queryset = RearPort.objects.all()
-
-
-class RearPortBulkDisconnectView(BulkDisconnectView):
-    queryset = RearPort.objects.all()
-
-
-class RearPortBulkDeleteView(generic.BulkDeleteView):
-    queryset = RearPort.objects.all()
-    filterset = filters.RearPortFilterSet
-    table = tables.RearPortTable
+    object_detail_content = object_detail.ObjectDetailContent(
+        panels=(
+            object_detail.ObjectFieldsPanel(
+                weight=100,
+                section=SectionChoices.LEFT_HALF,
+                exclude_fields=("cable_termination",),
+                hide_if_unset=("device", "module"),
+            ),
+            object_detail.ConnectionPanel(
+                weight=100,
+                section=SectionChoices.RIGHT_HALF,
+                trace_url_name="dcim:rearport_trace",
+            ),
+            object_detail.ObjectsTablePanel(
+                weight=200,
+                section=SectionChoices.FULL_WIDTH,
+                table_class=tables.FrontPortTable,
+                table_filter="rear_port",
+                select_related_fields=[*FrontPort.cable_columns_select_related_fields(), "device", "module"],
+                exclude_columns=["rear_port"],
+            ),
+        ),
+    )
 
 
 #
@@ -4870,146 +4896,102 @@ class RearPortBulkDeleteView(generic.BulkDeleteView):
 #
 
 
-class DeviceBayListView(generic.ObjectListView):
+class DeviceBayUIViewSet(
+    DeviceComponentPageMixin,
+    ComponentCreateViewMixin,
+    NautobotUIViewSet,
+):
     queryset = DeviceBay.objects.all()
-    filterset = filters.DeviceBayFilterSet
-    filterset_form = forms.DeviceBayFilterForm
-    table = tables.DeviceBayTable
+    filterset_class = filters.DeviceBayFilterSet
+    filterset_form_class = forms.DeviceBayFilterForm
+    bulk_update_form_class = forms.DeviceBayBulkEditForm
+    create_form_class = forms.DeviceBayCreateForm
+    form_class = forms.DeviceBayForm
+    serializer_class = serializers.DeviceBaySerializer
+    table_class = tables.DeviceBayTable
     action_buttons = ("import", "export")
-
-
-class DeviceBayView(DeviceComponentPageMixin, generic.ObjectView):
-    queryset = DeviceBay.objects.all()
     device_breadcrumb_url = "dcim:device_devicebays"
+    object_detail_content = object_detail.ObjectDetailContent(
+        panels=(
+            object_detail.ObjectFieldsPanel(
+                weight=100, section=SectionChoices.LEFT_HALF, exclude_fields=("installed_device",)
+            ),
+            object_detail.KeyValueTablePanel(
+                weight=100,
+                section=SectionChoices.RIGHT_HALF,
+                label="Installed Device",
+                context_data_key="installed_device_data",
+                hide_if_unset=["device_type"],
+            ),
+        )
+    )
 
     def get_extra_context(self, request, instance):
-        return {
-            "device_breadcrumb_url": self.device_breadcrumb_url,
-            **super().get_extra_context(request, instance),
-        }
+        context = super().get_extra_context(request, instance)
 
+        if self.action == "retrieve":
+            installed_device = instance.installed_device
+            context["installed_device_data"] = {
+                "device": installed_device,
+                "device_type": installed_device.device_type if installed_device else None,
+            }
 
-class DeviceBayCreateView(generic.ComponentCreateView):
-    queryset = DeviceBay.objects.all()
-    form = forms.DeviceBayCreateForm
-    model_form = forms.DeviceBayForm
+        return context
 
+    @action(detail=True, methods=["GET", "POST"], custom_view_base_action="change")
+    def populate(self, request, *args, **kwargs):
+        device_bay = self.get_object()
 
-class DeviceBayEditView(generic.ObjectEditView):
-    queryset = DeviceBay.objects.all()
-    model_form = forms.DeviceBayForm
-    template_name = "dcim/device_component_edit.html"
+        if request.method == "POST":
+            form = forms.PopulateDeviceBayForm(device_bay, request.POST)
+            restrict_form_fields(form, request.user)
+            if form.is_valid():
+                device_bay.installed_device = form.cleaned_data["installed_device"]
+                device_bay.validated_save()
+                messages.success(
+                    request,
+                    f"Added {device_bay.installed_device} to {device_bay}.",
+                )
+                return redirect("dcim:device_devicebays", pk=device_bay.device.pk)
+        else:
+            form = forms.PopulateDeviceBayForm(device_bay)
+            restrict_form_fields(form, request.user)
 
-
-class DeviceBayDeleteView(generic.ObjectDeleteView):
-    queryset = DeviceBay.objects.all()
-
-
-class DeviceBayPopulateView(generic.ObjectEditView):
-    queryset = DeviceBay.objects.all()
-
-    def get(self, request, *args, **kwargs):
-        device_bay = get_object_or_404(self.queryset, pk=kwargs["pk"])
-        form = forms.PopulateDeviceBayForm(device_bay)
-
-        return render(
-            request,
-            "dcim/devicebay_populate.html",
+        return Response(
             {
+                "template": "dcim/devicebay_populate.html",
                 "device_bay": device_bay,
                 "form": form,
                 "return_url": self.get_return_url(request, device_bay),
             },
         )
 
-    def post(self, request, *args, **kwargs):
-        device_bay = get_object_or_404(self.queryset, pk=kwargs["pk"])
-        form = forms.PopulateDeviceBayForm(device_bay, request.POST)
+    @action(detail=True, methods=["GET", "POST"], custom_view_base_action="change")
+    def depopulate(self, request, *args, **kwargs):
+        device_bay = self.get_object()
 
-        if form.is_valid():
-            device_bay.installed_device = form.cleaned_data["installed_device"]
-            device_bay.save()
-            messages.success(
-                request,
-                f"Added {device_bay.installed_device} to {device_bay}.",
-            )
+        if request.method == "POST":
+            form = ConfirmationForm(request.POST)
+            if form.is_valid():
+                removed_device = device_bay.installed_device
+                device_bay.installed_device = None
+                device_bay.validated_save()
+                messages.success(
+                    request,
+                    f"Removed {removed_device} from {device_bay}.",
+                )
+                return redirect("dcim:device_devicebays", pk=device_bay.device.pk)
+        else:
+            form = ConfirmationForm()
 
-            return redirect("dcim:device_devicebays", pk=device_bay.device.pk)
-
-        return render(
-            request,
-            "dcim/devicebay_populate.html",
+        return Response(
             {
+                "template": "dcim/devicebay_depopulate.html",
                 "device_bay": device_bay,
                 "form": form,
                 "return_url": self.get_return_url(request, device_bay),
             },
         )
-
-
-class DeviceBayDepopulateView(generic.ObjectEditView):
-    queryset = DeviceBay.objects.all()
-
-    def get(self, request, *args, **kwargs):
-        device_bay = get_object_or_404(self.queryset, pk=kwargs["pk"])
-        form = ConfirmationForm()
-
-        return render(
-            request,
-            "dcim/devicebay_depopulate.html",
-            {
-                "device_bay": device_bay,
-                "form": form,
-                "return_url": self.get_return_url(request, device_bay),
-            },
-        )
-
-    def post(self, request, *args, **kwargs):
-        device_bay = get_object_or_404(self.queryset, pk=kwargs["pk"])
-        form = ConfirmationForm(request.POST)
-
-        if form.is_valid():
-            removed_device = device_bay.installed_device
-            device_bay.installed_device = None
-            device_bay.save()
-            messages.success(
-                request,
-                f"Removed {removed_device} from {device_bay}.",
-            )
-
-            return redirect("dcim:device_devicebays", pk=device_bay.device.pk)
-
-        return render(
-            request,
-            "dcim/devicebay_depopulate.html",
-            {
-                "device_bay": device_bay,
-                "form": form,
-                "return_url": self.get_return_url(request, device_bay),
-            },
-        )
-
-
-class DeviceBayBulkImportView(generic.BulkImportView):  # 3.0 TODO: remove, unused
-    queryset = DeviceBay.objects.all()
-    table = tables.DeviceBayTable
-
-
-class DeviceBayBulkEditView(generic.BulkEditView):
-    queryset = DeviceBay.objects.all()
-    filterset = filters.DeviceBayFilterSet
-    table = tables.DeviceBayTable
-    form = forms.DeviceBayBulkEditForm
-
-
-class DeviceBayBulkRenameView(BaseDeviceComponentsBulkRenameView):
-    queryset = DeviceBay.objects.all()
-
-
-class DeviceBayBulkDeleteView(generic.BulkDeleteView):
-    queryset = DeviceBay.objects.all()
-    filterset = filters.DeviceBayFilterSet
-    table = tables.DeviceBayTable
 
 
 #
@@ -5088,70 +5070,50 @@ class ModuleBayUIViewSet(ModuleBayCommonViewSetMixin, NautobotUIViewSet, ObjectB
 #
 
 
-class InventoryItemListView(generic.ObjectListView):
-    queryset = InventoryItem.objects.all()
-    filterset = filters.InventoryItemFilterSet
-    filterset_form = forms.InventoryItemFilterForm
-    table = tables.InventoryItemTable
+class InventoryItemFieldsPanel(object_detail.ObjectFieldsPanel):
+    """ObjectFieldsPanel with context-aware rendering of `software_version` and its image files."""
+
+    def render_value(self, key, value, context):
+        if key == "software_version":
+            instance = get_obj_from_context(context, self.context_object_key)
+            return render_software_version_and_image_files(instance, value, context)
+        return super().render_value(key, value, context)
+
+
+class InventoryItemUIViewSet(DeviceComponentPageMixin, ComponentCreateViewMixin, NautobotUIViewSet):
+    queryset = InventoryItem.objects.select_related("device", "manufacturer", "software_version")
+    filterset_class = filters.InventoryItemFilterSet
+    filterset_form_class = forms.InventoryItemFilterForm
+    bulk_update_form_class = forms.InventoryItemBulkEditForm
+    create_form_class = forms.InventoryItemCreateForm
+    form_class = forms.InventoryItemForm
+    serializer_class = serializers.InventoryItemSerializer
+    table_class = tables.InventoryItemTable
+    create_template_name = "dcim/inventoryitem_add.html"
     action_buttons = ("import", "export")
-
-
-class InventoryItemView(DeviceComponentPageMixin, generic.ObjectView):
-    queryset = InventoryItem.objects.all().select_related("device", "manufacturer", "software_version")
     device_breadcrumb_url = "dcim:device_inventory"
 
-    def get_extra_context(self, request, instance):
-        # Software images
-        if instance.software_version is not None:
-            software_version_images = instance.software_version.software_image_files.restrict(request.user, "view")
-        else:
-            software_version_images = []
-
-        return {
-            "device_breadcrumb_url": self.device_breadcrumb_url,
-            "software_version_images": software_version_images,
-            **super().get_extra_context(request, instance),
-        }
-
-
-class InventoryItemEditView(generic.ObjectEditView):
-    queryset = InventoryItem.objects.all()
-    model_form = forms.InventoryItemForm
-    template_name = "dcim/inventoryitem_edit.html"
-
-
-class InventoryItemCreateView(generic.ComponentCreateView):
-    queryset = InventoryItem.objects.all()
-    form = forms.InventoryItemCreateForm
-    model_form = forms.InventoryItemForm
-    template_name = "dcim/inventoryitem_add.html"
-
-
-class InventoryItemDeleteView(generic.ObjectDeleteView):
-    queryset = InventoryItem.objects.all()
-
-
-class InventoryItemBulkImportView(generic.BulkImportView):  # 3.0 TODO: remove, unused
-    queryset = InventoryItem.objects.all()
-    table = tables.InventoryItemTable
-
-
-class InventoryItemBulkEditView(generic.BulkEditView):
-    queryset = InventoryItem.objects.select_related("device", "manufacturer")
-    filterset = filters.InventoryItemFilterSet
-    table = tables.InventoryItemTable
-    form = forms.InventoryItemBulkEditForm
-
-
-class InventoryItemBulkRenameView(BaseDeviceComponentsBulkRenameView):
-    queryset = InventoryItem.objects.all()
-
-
-class InventoryItemBulkDeleteView(generic.BulkDeleteView):
-    queryset = InventoryItem.objects.select_related("device", "manufacturer")
-    table = tables.InventoryItemTable
-    template_name = "dcim/inventoryitem_bulk_delete.html"
-    filterset = filters.InventoryItemFilterSet
+    object_detail_content = object_detail.ObjectDetailContent(
+        panels=(
+            InventoryItemFieldsPanel(
+                weight=100,
+                section=SectionChoices.LEFT_HALF,
+                label="Inventory Item",
+                fields=[
+                    "device",
+                    "parent",
+                    "name",
+                    "label",
+                    "manufacturer",
+                    "part_id",
+                    "serial",
+                    "asset_tag",
+                    "software_version",
+                    "description",
+                ],
+            ),
+        ),
+    )
 
 
 #
@@ -5270,6 +5232,150 @@ class DeviceBulkAddInventoryItemView(generic.BulkComponentCreateView):
 
 
 #
+# Cable Types
+#
+def _mapping_matches_dimensions(mapping, a_connectors, b_connectors, total_lanes):
+    """True if `mapping` is shape-consistent with the given lane dimensions per validate_cable_breakout_mapping."""
+    if not (a_connectors and b_connectors and total_lanes):
+        return False
+    try:
+        validate_cable_breakout_mapping(mapping, a_connectors, b_connectors, total_lanes)
+    except ValidationError:
+        return False
+    return True
+
+
+def _user_labels_from_mapping(mapping):
+    """Build a `(a_connector, a_position, b_connector, b_position) -> label` dict from an untrusted mapping list."""
+    if not isinstance(mapping, list):
+        return {}
+    labels = {}
+    for entry in mapping:
+        if not isinstance(entry, dict):
+            continue
+        label = entry.get("label")
+        if not (isinstance(label, str) and label):
+            continue
+        try:
+            key = (entry["a_connector"], entry["a_position"], entry["b_connector"], entry["b_position"])
+        except KeyError:
+            continue
+        labels[key] = label
+    return labels
+
+
+class CableTypeUIViewSet(NautobotUIViewSet):
+    filterset_class = filters.CableTypeFilterSet
+    filterset_form_class = forms.CableTypeFilterForm
+    form_class = forms.CableTypeForm
+    bulk_update_form_class = forms.CableTypeBulkEditForm
+    queryset = CableType.objects.all()
+    serializer_class = serializers.CableTypeSerializer
+    table_class = tables.CableTypeTable
+    lookup_field = "pk"
+    object_detail_content = object_detail.ObjectDetailContent(
+        panels=(
+            object_detail.ObjectFieldsPanel(
+                weight=100,
+                section=SectionChoices.LEFT_HALF,
+                exclude_fields=["mapping"],
+            ),
+            object_detail.Panel(
+                weight=100,
+                section=SectionChoices.RIGHT_HALF,
+                label="Lane Mapping Diagram",
+                body_content_template_path="dcim/inc/cabletype_diagram_panel.html",
+            ),
+            object_detail.ObjectTextPanel(
+                weight=200,
+                section=SectionChoices.RIGHT_HALF,
+                label="Mapping",
+                object_field="mapping",
+                render_as=object_detail.BaseTextPanel.RenderOptions.JSON,
+            ),
+        ),
+        extra_tabs=(
+            object_detail.DistinctViewTab(
+                weight=100,
+                tab_id="cables",
+                label="Cables",
+                url_name="dcim:cabletype_cables",
+                related_object_attribute="cables",
+                panels=(
+                    object_detail.ObjectsTablePanel(
+                        section=SectionChoices.FULL_WIDTH,
+                        weight=100,
+                        table_class=tables.CableTable,
+                        table_filter="cable_type",
+                        tab_id="cables",
+                        include_paginator=True,
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    @action(
+        detail=True,
+        url_path="cables",
+        custom_view_base_action="view",
+        custom_view_additional_permissions=["dcim.view_cable"],
+    )
+    def cables(self, request, *args, **kwargs):
+        return Response({})
+
+    @action(
+        detail=False,
+        methods=["post"],
+        url_name="mapping_editor",
+        url_path="mapping-editor",
+        custom_view_base_action="view",
+    )
+    def mapping_editor(self, request):
+        """HTMX endpoint: return a server-rendered mapping table for given connector/lane counts."""
+
+        a_connectors = int(request.POST.get("a_connectors", 0) or 0)
+        b_connectors = int(request.POST.get("b_connectors", 0) or 0)
+        total_lanes = int(request.POST.get("total_lanes", 0) or 0)
+
+        # Derive per-side positions if the inputs are consistent; otherwise, we can't render a valid table.
+        a_positions = total_lanes // a_connectors if a_connectors and total_lanes % a_connectors == 0 else 0
+        b_positions = total_lanes // b_connectors if b_connectors and total_lanes % b_connectors == 0 else 0
+
+        # Parse the existing mapping from the request. If it's shape-consistent with the posted dimensions,
+        # use it as-is; otherwise (e.g. user just changed connector counts or total_lanes on an existing
+        # CableType), regenerate but carry over any user-supplied labels keyed by lane assignment.
+        posted_mapping = None
+        mapping_json = request.POST.get("mapping", "")
+        if mapping_json:
+            try:
+                posted_mapping = json.loads(mapping_json)
+            except (json.JSONDecodeError, TypeError):
+                posted_mapping = None
+
+        if _mapping_matches_dimensions(posted_mapping, a_connectors, b_connectors, total_lanes):
+            mapping = posted_mapping
+        elif all([a_connectors, b_connectors, total_lanes, a_positions, b_positions]):
+            mapping = generate_cable_breakout_mapping(
+                a_connectors, b_connectors, total_lanes, labels=_user_labels_from_mapping(posted_mapping)
+            )
+        else:
+            mapping = None
+
+        return render(
+            request,
+            "dcim/inc/breakout_mapping_table.html",
+            {
+                "mapping": mapping,
+                "a_connector_range": range(1, a_connectors + 1),
+                "a_position_range": range(1, a_positions + 1),
+                "b_connector_range": range(1, b_connectors + 1),
+                "b_position_range": range(1, b_positions + 1),
+            },
+        )
+
+
+#
 # Cables
 #
 class CableUIViewSet(NautobotUIViewSet):
@@ -5279,16 +5385,102 @@ class CableUIViewSet(NautobotUIViewSet):
     form_class = forms.CableForm
     serializer_class = serializers.CableSerializer
     table_class = tables.CableTable
-    queryset = Cable.objects.prefetch_related("termination_a", "termination_b")
-    action_buttons = ("import", "export")
+    queryset = Cable.objects.select_related("cable_type").prefetch_related(
+        Prefetch(
+            "terminations",
+            # `select_related`-ing the per-type FK columns (plus each termination's parent and the
+            # FKs its display string needs) lets the table's `terminations_a` / `terminations_b` and
+            # `*_parent` columns render every FK without an extra query per row.
+            queryset=CableToCableTermination.objects.select_related(*TERMINATION_CABLE_COLUMN_FK_FIELDS),
+        ),
+    )
+    action_buttons = ("add", "import", "export")
 
     def get_queryset(self):
         # 6933 fix: with prefetch related in queryset
-        # DeviceInterface is not properly cleared of _path_id
+        # DeviceInterface is not properly cleared of its cable_paths
         queryset = super().get_queryset()
         if self.action == "destroy":
             queryset = queryset.prefetch_related(None)
         return queryset
+
+    @action(
+        detail=True,
+        methods=["get"],
+        url_path="lane-form",
+        url_name="lane_form",
+        custom_view_base_action="view",
+    )
+    def lane_form(self, request, pk=None):
+        """HTMX endpoint: return the lane termination form partial for an existing cable."""
+        cable = self.get_object()
+        return self._render_lane_form(request, cable)
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="lane-form-new",
+        url_name="lane_form_new",
+        custom_view_base_action="view",
+    )
+    def lane_form_new(self, request):
+        """HTMX endpoint: return the lane termination form partial for a new (unsaved) cable."""
+        return self._render_lane_form(request, cable=None)
+
+    def _render_lane_form(self, request, cable):
+        """Shared: render the lane form partial with an optional cable-type override.
+
+        Only forwards keys actually present in `request.GET` into the form's initial — so the form
+        can distinguish "no override sent" (initial display) from "user cleared this field"
+        (explicit override) for the live-preview lane re-render.
+        """
+        initial = {}
+        for key in ("cable_type", "termination_a_type", "termination_a_id", "termination_b_type"):
+            if key in request.GET:
+                initial[key] = request.GET[key]
+
+        form = forms.CableForm(instance=cable, initial=initial)
+        return render(request, "dcim/inc/cable_lane_form.html", {"form": form})
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="lane-side-fields",
+        url_name="lane_side_fields",
+        custom_view_base_action="view",
+    )
+    def lane_side_fields(self, request):
+        """HTMX endpoint: return parent+termination fields for a specific lane side when the type changes.
+
+        The only piece of existing cable state the response depends on is the cable pk (forwarded by
+        the type select's `hx-vals`), used to re-apply the `available_for_cable` termination filter so
+        the cable's own endpoints stay pickable after a type change. It's absent when creating a cable.
+        """
+        connector = request.GET.get("connector", "1")
+        side = request.GET.get("side", "a")
+        cable_pk = request.GET.get("cable") or None
+        prefix = f"{side}_conn_{connector}"
+        # HTMX-only endpoint: the requesting type select sends its value as `<prefix>_type` via hx-include.
+        term_type = request.GET.get(f"{prefix}_type", "interface")
+
+        fieldset = CableTerminationFieldSet()
+        result = fieldset.get_fields(prefix, term_type=term_type, cable_pk=cable_pk)
+
+        # Build a minimal form-like object for template rendering.
+        temp_form = Form()
+        temp_form.fields.update(result["fields"])
+        for k, v in result["initial"].items():
+            temp_form.initial[k] = v
+
+        return render(
+            request,
+            "dcim/inc/cable_lane_side_fields.html",
+            {
+                "form": temp_form,
+                "parent_field": result["meta"]["parent_field"],
+                "term_field": result["meta"]["term_field"],
+            },
+        )
 
 
 class PathTraceView(generic.ObjectView):
@@ -5306,118 +5498,123 @@ class PathTraceView(generic.ObjectView):
 
         return super().dispatch(request, *args, **kwargs)
 
+    @staticmethod
+    def _select_path(cable_paths, cablepath_id):
+        """Return the `CablePath` from `cable_paths` matching `cablepath_id`, or the first as fallback."""
+        try:
+            path_id = uuid.UUID(cablepath_id)
+        except (AttributeError, TypeError, ValueError):
+            path_id = None
+        try:
+            return cable_paths.get(pk=path_id)
+        except CablePath.DoesNotExist:
+            return cable_paths.first()
+
+    @staticmethod
+    def _breakout_subinterface_origin(path):
+        """The breakout trunk's child (sub)interface mapped to the selected lane `path`, or None.
+
+        A trunk origin's CablePath identifies a lane by its breakout-side `peer_connector`; the
+        child interface whose breakout lane resolves to that same far connector is the subinterface
+        this lane belongs to. Returns None when the path origin isn't a breakout trunk with such a
+        child interface.
+        """
+        origin = getattr(path, "origin", None)
+        if origin is None or not hasattr(origin, "get_breakout_child_interface_for_connector"):
+            return None
+        return origin.get_breakout_child_interface_for_connector(path.peer_connector)
+
     def get_extra_context(self, request, instance):
         related_paths = []
+        cablepath_id = request.GET.get("cablepath_id")
 
-        # If tracing a PathEndpoint, locate the CablePath (if one exists) by its origin
+        # If tracing a PathEndpoint, locate the CablePath (if one exists) by its origin.
         if isinstance(instance, PathEndpoint):
-            path = instance._path
+            cable_paths = instance.cable_paths.all().prefetch_related("origin")
+            # A breakout trunk has one CablePath per lane; `cablepath_id` selects a single lane (e.g.
+            # tracing one subinterface), otherwise fall back to the first.
+            if cablepath_id is not None:
+                path = self._select_path(cable_paths, cablepath_id)
+            else:
+                path = cable_paths.first()
+            # Surface all of a breakout trunk's lane paths so the user can switch between lanes
+            # (subinterfaces) — including when one lane is already selected via `cablepath_id`, where
+            # this table is the only way back to the trunk's other lanes.
+            if cable_paths.count() > 1:  # breakout cable!
+                related_paths = cable_paths
 
         # Otherwise, find all CablePaths which traverse the specified object
         else:
             related_paths = CablePath.objects.filter(path__contains=instance).prefetch_related("origin")
             # Check for specification of a particular path (when tracing pass-through ports)
-
-            cablepath_id = request.GET.get("cablepath_id")
             if cablepath_id is not None:
-                try:
-                    path_id = uuid.UUID(cablepath_id)
-                except (AttributeError, TypeError, ValueError):
-                    path_id = None
-                try:
-                    path = related_paths.get(pk=path_id)
-                except CablePath.DoesNotExist:
-                    path = related_paths.first()
+                path = self._select_path(related_paths, cablepath_id)
             else:
                 path = related_paths.first()
 
-        return {
+        # Render the SVG trace diagram for the active path (if there is one).
+        trace_svg = ""
+        subinterface_origin = None
+        if path is not None and getattr(path, "origin", None) is not None:
+            # When a single lane of a breakout trunk was selected, originate the trace from the
+            # trunk's child (sub)interface mapped to that lane so the SVG renders it atop the trunk.
+            subinterface_origin = self._breakout_subinterface_origin(path) if cablepath_id is not None else None
+            trace_svg = CableTraceSVG(
+                subinterface_origin or path.origin,
+                base_url=request.build_absolute_uri("/").rstrip("/"),
+                cable_path=path,
+            ).render()
+
+        context = {
             "path": path,
             "related_paths": related_paths,
-            "total_length": path.get_total_length() if path else None,
+            "trace_svg": trace_svg,
             "view_titles": self.get_view_titles(),
             **super().get_extra_context(request, instance),
         }
+        # The URL traces the parent trunk, but a single selected lane is really tracing one
+        # subinterface — title it accordingly rather than the (misleading) parent interface.
+        if subinterface_origin is not None:
+            context["title"] = f"Cable Trace for {subinterface_origin}"
+        return context
 
 
-class CableCreateView(generic.ObjectEditView):
-    queryset = Cable.objects.all()
-    template_name = "dcim/cable_connect.html"
-
-    def dispatch(self, request, *args, **kwargs):
-        # Set the model_form class based on the type of component being connected
-        self.model_form = {
-            "console-port": forms.ConnectCableToConsolePortForm,
-            "console-server-port": forms.ConnectCableToConsoleServerPortForm,
-            "power-port": forms.ConnectCableToPowerPortForm,
-            "power-outlet": forms.ConnectCableToPowerOutletForm,
-            "interface": forms.ConnectCableToInterfaceForm,
-            "front-port": forms.ConnectCableToFrontPortForm,
-            "rear-port": forms.ConnectCableToRearPortForm,
-            "power-feed": forms.ConnectCableToPowerFeedForm,
-            "circuit-termination": forms.ConnectCableToCircuitTerminationForm,
-        }.get(kwargs.get("termination_b_type"), None)
-
-        return super().dispatch(request, *args, **kwargs)
-
-    def alter_obj(self, obj, request, url_args, url_kwargs):
-        termination_a_type = url_kwargs.get("termination_a_type")
-        termination_a_id = url_kwargs.get("termination_a_id")
-        termination_b_type_name = url_kwargs.get("termination_b_type")
-        self.termination_b_type = ContentType.objects.get(model=termination_b_type_name.replace("-", ""))
-
-        # Initialize Cable termination attributes
-        obj.termination_a = termination_a_type.objects.get(pk=termination_a_id)
-        obj.termination_b_type = self.termination_b_type
-
-        return obj
+class CableCreateView(LoginRequiredMixin, View):
+    """
+    Redirect shim for the per-termination-type `<port>_connect` URLs (referenced from row-action
+    menus across DCIM and Circuits). Forwards the A-side identity (plus an optional B-side type
+    pre-selection) into the unified `cable_add` form's query string, so the user lands on a
+    single form rather than a per-port specialization.
+    """
 
     def get(self, request, *args, **kwargs):
-        if self.model_form is None:
-            return HttpResponse(status_code=400)
+        termination_a_type = kwargs.get("termination_a_type")
+        termination_a_id = kwargs.get("termination_a_id")
+        termination_b_type_name = kwargs.get("termination_b_type")
 
-        obj = self.alter_obj(self.get_object(kwargs), request, args, kwargs)
+        if not termination_a_type or not termination_a_id:
+            return HttpResponseBadRequest("termination_a_type and termination_a_id must be provided")
 
-        # Parse initial data manually to avoid setting field values as lists
-        initial_data = {k: request.GET[k] for k in request.GET}
+        ct_a = ContentType.objects.get_for_model(termination_a_type)
+        return_url = request.GET.get("return_url", "")
 
-        # Set initial location and rack based on side A termination (if not already set)
-        termination_a_location = getattr(obj.termination_a.parent, "location", None)
-        if "termination_b_location" not in initial_data:
-            initial_data["termination_b_location"] = termination_a_location
-        if "termination_b_rack" not in initial_data:
-            initial_data["termination_b_rack"] = getattr(obj.termination_a.parent, "rack", None)
+        add_url = reverse("dcim:cable_add")
+        params = {
+            "termination_a_type": f"{ct_a.app_label}.{ct_a.model}",
+            "termination_a_id": termination_a_id,
+        }
+        if termination_b_type_name:
+            # The URL path captures the type in hyphenated form (e.g. "console-server-port");
+            # `ContentType.objects.get(model=...)` expects the model name (no hyphens).
+            try:
+                ct_b = ContentType.objects.get(model=termination_b_type_name.replace("-", ""))
+            except ContentType.DoesNotExist:
+                return HttpResponseBadRequest("Unknown termination_b_type")
+            params["termination_b_type"] = f"{ct_b.app_label}.{ct_b.model}"
+        if return_url and url_has_allowed_host_and_scheme(return_url, allowed_hosts=request.get_host()):
+            params["return_url"] = iri_to_uri(return_url)
 
-        form = self.model_form(exclude_id=kwargs.get("termination_a_id"), instance=obj, initial=initial_data)
-
-        # the following builds up a CSS query selector to match all drop-downs
-        # in the termination_b form except the termination_b_id. this is necessary to reset the termination_b_id
-        # drop-down whenever any of these drop-downs' values changes. this cannot be hardcoded because the form is
-        # selected dynamically and therefore the fields change depending on the value of termination_b_type (L2358)
-        js_select_onchange_query = ", ".join(
-            [
-                f"select#id_{field_name}"
-                for field_name, field in form.fields.items()
-                # include all termination_b_* fields:
-                if field_name.startswith("termination_b")
-                # exclude termination_b_id:
-                and field_name != "termination_b_id"
-                # include only HTML select fields:
-                and field.widget.input_type == "select"
-            ]
-        )
-        return render(
-            request,
-            self.template_name,
-            {
-                "obj": obj,
-                "obj_type": Cable._meta.verbose_name,
-                "termination_b_type": self.termination_b_type.name,
-                "form": form,
-                "return_url": self.get_return_url(request, obj),
-                "js_select_onchange_query": js_select_onchange_query,
-            },
-        )
+        return redirect(f"{add_url}?{urlencode(params)}")
 
 
 #
@@ -5430,7 +5627,7 @@ class ConnectionsListView(generic.ObjectListView):
 
 
 class ConsoleConnectionsListView(ConnectionsListView):
-    queryset = ConsolePort.objects.filter(_path__isnull=False)
+    queryset = ConsolePort.objects.filter(cable_paths__isnull=False).distinct()
     filterset = filters.ConsoleConnectionFilterSet
     filterset_form = forms.ConsoleConnectionFilterForm
     table = tables.ConsoleConnectionTable
@@ -5440,7 +5637,7 @@ class ConsoleConnectionsListView(ConnectionsListView):
 
 
 class PowerConnectionsListView(ConnectionsListView):
-    queryset = PowerPort.objects.filter(_path__isnull=False)
+    queryset = PowerPort.objects.filter(cable_paths__isnull=False).distinct()
     filterset = filters.PowerConnectionFilterSet
     filterset_form = forms.PowerConnectionFilterForm
     table = tables.PowerConnectionTable
@@ -5462,25 +5659,48 @@ class InterfaceConnectionsListView(ConnectionsListView):
         super().__init__(*args, **kwargs)
         self.get_queryset()  # Populate self.queryset after init.
 
-    def get_queryset(self):
+    def get_required_permission(self):
+        # The view exposes interface connections; gate it on Interface view permission rather than
+        # CablePath view permission (which is the model of the underlying queryset).
+        return "dcim.view_interface"
+
+    @staticmethod
+    def base_queryset():
         """
-        This is a required so that the call to `ContentType.objects.get_for_model` does not result in a circular import.
+        Build the canonical CablePath queryset of interface-to-interface connections for the list view.
+
+        Delegates to `CablePath.interface_connections()` (shared with the REST API so both stay
+        consistent) for the trunk-onto-one-side canonicalization and ordering, then adds the UI-only
+        `group_row` window annotation — the lane index within each origin (1 for the first lane) — so
+        the table can blank the repeated trunk cell on continuation rows of a breakout.
         """
-        qs = Interface.objects.filter(_path__isnull=False).exclude(
-            # If an Interface is connected to another Interface, avoid returning both (A, B) and (B, A)
-            # Unfortunately we can't use something consistent to pick which pair to exclude (such as device or name)
-            # as _path.destination is a GenericForeignKey without a corresponding GenericRelation and so cannot be
-            # used for reverse querying.
-            # The below at least ensures uniqueness, but doesn't guarantee whether we get (A, B) or (B, A)
-            # TODO: this is very problematic when filtering the view via FilterSet - if the filterset matches (A), then
-            #       the connection will appear in the table, but if it only matches (B) then the connection will not!
-            _path__destination_type=ContentType.objects.get_for_model(Interface),
-            pk__lt=F("_path__destination_id"),
+        return CablePath.interface_connections().annotate(
+            group_row=Window(
+                expression=RowNumber(),
+                partition_by=[F("origin_type"), F("origin_id")],
+                order_by=[F("peer_connector")],
+            )
         )
+
+    def get_queryset(self):
         if self.queryset is None:
-            self.queryset = qs
+            self.queryset = self.base_queryset()
 
         return self.queryset
+
+    def has_permission(self):
+        """
+        Override base permission filtering to apply Interface-level permission to BOTH endpoints of
+        each connection, rather than calling `CablePath.objects.restrict()` (which would key off the
+        non-existent `dcim.view_cablepath` permission).
+        """
+        user = self.request.user
+        permission_required = self.get_required_permission()
+        if not user.has_perms((permission_required, *self.additional_permissions)):
+            return False
+        visible_ifaces = Interface.objects.restrict(user, "view").values("pk")
+        self.queryset = self.queryset.filter(origin_id__in=visible_ifaces, destination_id__in=visible_ifaces)
+        return True
 
 
 #
@@ -5835,6 +6055,7 @@ class PowerFeedUIViewSet(NautobotUIViewSet):
                 label="Connection",
                 context_data_key="connection_data",
             ),
+            *get_connected_endpoint_panels("powerfeed"),
         )
     )
 
@@ -5879,11 +6100,14 @@ class PowerFeedUIViewSet(NautobotUIViewSet):
         return "Connected Device", self._get_connected_device_html(instance)
 
     def _get_connected_device_html(self, instance):
-        endpoint = getattr(instance, "connected_endpoint", None)
-        if endpoint and endpoint.parent:
-            parent = helpers.hyperlinked_object(endpoint.parent)
-            return format_html("{} ({})", parent, endpoint)
-        return None
+        endpoints = [e for e in instance.get_connected_endpoints() if e is not None and e.parent]
+        if not endpoints:
+            return None
+        return format_html_join(
+            mark_safe("<br>"),
+            "{} ({})",
+            ((helpers.hyperlinked_object(endpoint.parent), endpoint) for endpoint in endpoints),
+        )
 
     def _get_utilization_data(self, instance):
         endpoint = getattr(instance, "connected_endpoint", None)
@@ -5910,23 +6134,41 @@ class PowerFeedUIViewSet(NautobotUIViewSet):
             trace_url = reverse("dcim:powerfeed_trace", kwargs={"pk": instance.pk})
             cable_html = format_html(
                 '{} <a href="{}" class="btn btn-primary btn-xs" title="Trace">'
-                '<i class="mdi mdi-transit-connection-variant"></i></a>',
+                '<span class="mdi mdi-transit-connection-variant"></span></a>',
                 helpers.hyperlinked_object(instance.cable),
                 trace_url,
             )
 
-            endpoint = getattr(instance, "connected_endpoint", None)
+            endpoints = [e for e in instance.get_connected_endpoints() if e is not None]
             endpoint_data = {}
 
-            if endpoint:
+            if len(endpoints) == 1:
+                endpoint = endpoints[0]
                 endpoint_obj = getattr(endpoint, "device", None) or getattr(endpoint, "module", None)
-                # Removed the unused 'path' variable
                 endpoint_data = {
                     "Device" if getattr(endpoint, "device", None) else "Module": endpoint_obj,
                     "Power Port": endpoint,
                     "Type": endpoint.get_type_display() if hasattr(endpoint, "get_type_display") else None,
                     "Description": endpoint.description,
                     "Path Status": self._get_path_status_html(instance),  # Render Path Status dynamically
+                }
+            elif len(endpoints) > 1:
+                # Multi-termination cable: list every connected power port rather than only the first.
+                endpoint_data = {
+                    "Power Ports": format_html_join(
+                        mark_safe("<br>"),
+                        "{} ({})",
+                        (
+                            (
+                                helpers.hyperlinked_object(
+                                    getattr(endpoint, "device", None) or getattr(endpoint, "module", None)
+                                ),
+                                helpers.hyperlinked_object(endpoint),
+                            )
+                            for endpoint in endpoints
+                        ),
+                    ),
+                    "Path Status": self._get_path_status_html(instance),
                 }
 
             return {
@@ -5936,15 +6178,13 @@ class PowerFeedUIViewSet(NautobotUIViewSet):
 
         if request.user.has_perm("dcim.add_cable"):
             connect_url = (
-                reverse(
-                    "dcim:powerfeed_connect",
-                    kwargs={"termination_a_id": instance.pk, "termination_b_type": "power-port"},
-                )
-                + f"?return_url={instance.get_absolute_url()}"
+                reverse("dcim:cable_add")
+                + f"?termination_a_type=dcim.powerfeed&termination_a_id={instance.pk}"
+                + f"&return_url={instance.get_absolute_url()}"
             )
             connect_link = format_html(
                 '<a href="{}" class="btn btn-primary btn-sm float-end">'
-                '<span class="mdi mdi-ethernet-cable" aria-hidden="true"></span> Connect</a>',
+                '<span class="mdi mdi-ethernet-cable me-4" aria-hidden="true"></span>Add Cable</a>',
                 connect_url,
             )
             return {"Connection": format_html("Not connected {}", connect_link)}
