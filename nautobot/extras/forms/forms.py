@@ -51,10 +51,10 @@ from nautobot.extras.choices import (
     ComputedFieldTypeChoices,
     CustomFieldFilterLogicChoices,
     DynamicGroupTypeChoices,
+    JobCancelTypeChoices,
     JobExecutionType,
     JobQueueTypeChoices,
     JobResultStatusChoices,
-    JobRevocationTypeChoices,
     MetadataTypeDataTypeChoices,
     ObjectChangeActionChoices,
     ObjectChangeEventContextChoices,
@@ -1981,10 +1981,10 @@ class JobResultFilterForm(BootstrapMixin, forms.Form):
         label="Has Job Console Entries",
         widget=StaticSelect2(choices=BOOLEAN_WITH_BLANK_CHOICES),
     )
-    revocation_type = forms.MultipleChoiceField(
-        choices=JobRevocationTypeChoices,
+    cancel_type = forms.MultipleChoiceField(
+        choices=JobCancelTypeChoices,
         required=False,
-        label="Revocation Type",
+        label="Cancel Type",
         widget=StaticSelect2Multiple(),
     )
 
@@ -2522,6 +2522,12 @@ class RelationshipForm(BootstrapMixin, forms.ModelForm):
         label="Key",
         max_length=CHARFIELD_MAX_LENGTH,
         slug_source="label",
+    )
+    description = forms.CharField(
+        label="Description",
+        max_length=CHARFIELD_MAX_LENGTH,
+        required=False,
+        help_text="Markdown formatting and a limited subset of HTML are supported",
     )
     source_type = forms.ModelChoiceField(
         queryset=ContentType.objects.filter(FeatureQuery("relationships").get_query()).order_by("app_label", "model"),

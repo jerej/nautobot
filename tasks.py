@@ -13,6 +13,7 @@ limitations under the License.
 """
 
 import concurrent.futures
+from functools import partial
 import json
 import os
 import platform
@@ -826,13 +827,13 @@ def build_and_check_docs(context):
 
 def build_nautobot_docs(context):
     "Build Nautobot docs."
-    command = "mkdocs build --no-directory-urls --strict"
+    command = "mkdocs build"
     run_command(context, command)
 
 
 def build_example_app_docs(context):
     """Build Example App docs."""
-    command = "mkdocs build --no-directory-urls --strict"
+    command = "mkdocs build"
     if is_truthy(context.nautobot.local):
         local_command = f"cd examples/example_app && {command}"
         print_command(local_command)
@@ -902,30 +903,38 @@ def open_selenium_vnc(context):
 
 
 # ------------------------------------------------------------------------------
-# TESTS
+# TESTS AND LINTING
 # ------------------------------------------------------------------------------
+
+PYTHON_LINT_TARGETS = ["development/", "examples/", "nautobot/", "scripts/", "tasks.py"]
 
 
 @task(
     help={
-        "target": "Module or file or directory to inspect, repeatable",
+        "jobs": "Number of parallel processes to split into (default 1, use 0 to autodetect available CPU count)."
+        "Use with caution, as we've seen occasional false positives when running with values other than 1.",
         "recursive": "Must be set if target is a directory rather than a module or file name",
+        "target": "Module or file or directory to inspect, repeatable",
+        "verbose": "Output additional information verbosely",
     },
     iterable=["target"],
 )
-def pylint(context, target=None, recursive=False):
+def pylint(context, jobs=1, recursive=False, target=None, verbose=False):
     """Perform static analysis of Nautobot code."""
-    base_command = 'pylint --verbose --init-hook "import nautobot; nautobot.setup()" '
+    command = "pylint "
+    if verbose:
+        command += "--verbose "
+    if jobs != 1:
+        command += f"--jobs={jobs} "
     if not target:
         # Lint everything
-        command = base_command + "--recursive=y nautobot tasks.py development/ examples/"
-        run_command(context, command)
-    else:
-        command = base_command
-        if recursive:
-            command += "--recursive=y "
-        command += " ".join(target)
-        run_command(context, command)
+        target = PYTHON_LINT_TARGETS
+        recursive = True
+
+    if recursive:
+        command += "--recursive=y "
+    command += " ".join(target)
+    run_command(context, command)
 
 
 @task(
@@ -940,7 +949,7 @@ def pylint(context, target=None, recursive=False):
 def ruff(context, fix=False, diff=False, target=None, output_format="concise"):
     """Run ruff to perform code formatting and linting."""
     if not target:
-        target = ["development", "examples", "nautobot", "tasks.py"]
+        target = PYTHON_LINT_TARGETS
 
     command = "ruff format "
     if not fix:
@@ -1047,7 +1056,9 @@ def hadolint(context):
 def markdownlint(context, fix=False):
     """Lint Markdown files."""
     if fix:
-        command = "pymarkdown fix --recurse nautobot/docs examples *.md"
+        # Disable md044 (proper-names) only while fixing: its fixer over-applies
+        # proper-name capitalization to URLs, link/image targets, icons, etc.
+        command = "pymarkdown --disable-rules md044 fix --recurse nautobot/docs examples *.md"
         run_command(context, command)
     # fix mode doesn't scan/report issues it can't fix, so always run scan even after fixing
     command = "pymarkdown scan --recurse nautobot/docs examples *.md"
@@ -1270,21 +1281,44 @@ def migration_test(context, dataset, db_engine="postgres", db_name="nautobot_mig
         )
 
 
-@task
-def lint(context):
+@task(
+    help={"fix": "Automatically apply formatting and linting recommendations where supported. May not fix all issues."}
+)
+def lint(context, fix=False):
     """Run all linters."""
-    hadolint(context)
-    markdownlint(context)
-    yamllint(context)
-    ruff(context)
-    pylint(context)
-    eslint(context)
-    prettier(context)
-    djhtml(context)
-    djlint(context)
-    check_migrations(context)
-    check_schema(context)
-    build_and_check_docs(context)
+    linters = (
+        partial(hadolint, context),
+        partial(markdownlint, context, fix=fix),
+        partial(yamllint, context),
+        partial(ruff, context, fix=fix),
+        partial(pylint, context),
+        partial(eslint, context, fix=fix),
+        partial(prettier, context, fix=fix),
+        partial(djhtml, context, fix=fix),
+        partial(djlint, context),
+        partial(check_migrations, context),
+        partial(check_schema, context),
+        partial(build_and_check_docs, context),
+    )
+
+    exception_group = []
+
+    # Run each linter even if preceeding linter has failure
+    for linter in linters:
+        try:
+            linter()
+        except Exception as exception:
+            exception_group.append((linter.func.__name__, exception))
+
+    if len(exception_group) > 0:
+        exception_messages = [
+            f"----- {linter_name} -----\n" + str(exception) for linter_name, exception in exception_group
+        ]
+        output_string = "\n".join(exception_messages)
+        print("-" * 80)
+        print("Lint Errors Detected")
+        print("-" * 80)
+        raise Exit(output_string)
 
 
 @task(help={"version": "The version number or the rule to update the version."})

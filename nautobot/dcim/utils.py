@@ -2,6 +2,7 @@ from copy import deepcopy
 from typing import Optional
 import uuid
 
+from django.apps import apps
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ValidationError
 from django.db import transaction
@@ -9,10 +10,14 @@ from django.utils.html import format_html, format_html_join
 from netutils.lib_mapper import NAME_TO_ALL_LIB_MAPPER, NAME_TO_LIB_MAPPER_REVERSE
 
 from nautobot.core.choices import ColorChoices
-from nautobot.core.templatetags.helpers import hyperlinked_object
+from nautobot.core.templatetags.helpers import bettertitle, hyperlinked_object
 from nautobot.core.utils.config import get_settings_or_config
 from nautobot.dcim.choices import InterfaceModeChoices
-from nautobot.dcim.constants import DEFAULT_CABLE_TYPES, NONCONNECTABLE_IFACE_TYPES
+from nautobot.dcim.constants import (
+    COMPATIBLE_TERMINATION_TYPES,
+    DEFAULT_CABLE_TYPES,
+    NONCONNECTABLE_IFACE_TYPES,
+)
 
 
 def compile_path_node(ct_id, object_id):
@@ -49,15 +54,21 @@ def cable_status_color_css(record):
     Given a record such as an Interface, return the CSS needed to apply appropriate coloring to it.
     """
     if not record.cable:
+        # A breakout child (sub)interface has no cable of its own; color it after its parent trunk's
+        # cable when its lane is connected. `parent_interface` / `get_breakout_lane` are Interface-only,
+        # so guard for other cable-terminable types (console/power ports, etc.).
+        lane = record.get_breakout_lane() if getattr(record, "parent_interface_id", None) else None
+        if lane and lane.far_termination:
+            return cable_status_color_css(record.parent_interface)
         return ""
-    else:
-        CABLE_STATUS_TO_CSS_CLASS = {
-            ColorChoices.COLOR_GREEN: "table-success",
-            ColorChoices.COLOR_AMBER: "table-warning",
-            ColorChoices.COLOR_CYAN: "table-info",
-        }
-        status_color = record.cable.get_status_color().strip("#")
-        return CABLE_STATUS_TO_CSS_CLASS.get(status_color, "")
+
+    CABLE_STATUS_TO_CSS_CLASS = {
+        ColorChoices.COLOR_GREEN: "table-success",
+        ColorChoices.COLOR_AMBER: "table-warning",
+        ColorChoices.COLOR_CYAN: "table-info",
+    }
+    status_color = record.cable.get_status_color().strip("#")
+    return CABLE_STATUS_TO_CSS_CLASS.get(status_color, "")
 
 
 def get_network_driver_mapping_tool_names():
@@ -176,14 +187,14 @@ def render_software_version_and_image_files(instance, software_version, context)
     return display
 
 
-def populate_default_cable_types(apps, schema_editor=None):
+def populate_default_cable_types(apps, schema_editor=None):  # pylint: disable=redefined-outer-name
     """Create default cable type records."""
     CableType = apps.get_model("dcim", "CableType")
     for name, defaults in DEFAULT_CABLE_TYPES.items():
         CableType.objects.get_or_create(name=name, defaults=defaults)
 
 
-def clear_default_cable_types(apps, schema_editor=None):
+def clear_default_cable_types(apps, schema_editor=None):  # pylint: disable=redefined-outer-name
     """Delete default cable type records."""
     CableType = apps.get_model("dcim", "CableType")
     for name in DEFAULT_CABLE_TYPES.keys():
@@ -328,6 +339,49 @@ def validate_cable_breakout_mapping(mapping: list, a_connectors=None, b_connecto
     return mapping, a_connectors, b_connectors, total_lanes
 
 
+def _distribute_rowspans(num_cells, num_rows):
+    """Split `num_rows` rows into `num_cells` contiguous chunks as evenly as possible.
+
+    Returns a list of `num_cells` rowspans summing to `num_rows`, with any remainder spread
+    across the leading chunks (e.g. `(2, 3)` → `[2, 1]`, `(3, 3)` → `[1, 1, 1]`).
+    """
+    base, remainder = divmod(num_rows, num_cells)
+    return [base + (1 if i < remainder else 0) for i in range(num_cells)]
+
+
+def build_connector_row_layout(mapping):
+    """Build the row/rowspan layout for rendering a cable's connector-to-connector connections.
+
+    Given a `CableType.mapping` (a list of dicts with `a_connector`/`b_connector` keys), return a
+    flat list of row layout dicts::
+
+        {"a_connector": int|None, "b_connector": int|None, "a_rowspan": int, "b_rowspan": int}
+
+    A rowspan of 0 means that side's cell is covered by an earlier row's rowspan and should be
+    skipped when rendering. Both the cable detail view and the HTMX connection-edit form consume
+    this layout, so the structure stays consistent between them.
+
+    Each side's distinct connectors are laid out independently down their own column, spread evenly
+    over `max(#A connectors, #B connectors)` rows. This yields the familiar nested rowspan layout
+    for breakouts (1xN, Nx1, straight NxN) while staying structurally valid for a mesh — e.g. a
+    polarity-shuffled 2x2 where each A connector wires to *both* B connectors and no rowspan
+    grouping could represent the crossings without overlapping cells and corrupting the table.
+    """
+    distinct_a = sorted({entry["a_connector"] for entry in mapping})
+    distinct_b = sorted({entry["b_connector"] for entry in mapping})
+    num_rows = max(len(distinct_a), len(distinct_b))
+
+    rows = [{"a_connector": None, "b_connector": None, "a_rowspan": 0, "b_rowspan": 0} for _ in range(num_rows)]
+    for side, connectors in (("a", distinct_a), ("b", distinct_b)):
+        row_index = 0
+        for connector, span in zip(connectors, _distribute_rowspans(len(connectors), num_rows)):
+            rows[row_index][f"{side}_connector"] = connector
+            rows[row_index][f"{side}_rowspan"] = span
+            row_index += span
+
+    return rows
+
+
 # Cable validation utilities
 
 
@@ -410,3 +464,103 @@ def power_ports_connected_to(target_queryset):
     )
 
     return PowerPort.objects.filter(pk__in=powerport_ids)
+
+
+def get_connected_endpoint_tables(instance):
+    """Build per-type tables of the connected endpoints reachable from a `PathEndpoint`.
+
+    Walks the instance's CablePaths (one per breakout lane for a breakout cable), groups the
+    resolved destination endpoints by model, and renders each group with that model's existing
+    list table (resolved via `get_table_for_model`) so that multi-termination cables show *every*
+    connected endpoint rather than only the first. Returns a list of
+    ``{"heading": ..., "table": ...}`` dicts, ordered by endpoint type.
+
+    Returns an empty list for terminations that are not PathEndpoints (e.g. front/rear ports) or
+    that have no resolved destinations.
+
+    TODO: This is the legacy template-based equivalent of `get_connected_endpoint_panels()`. When the
+    component detail views that use it are migrated to the UI component framework, drop this helper and
+    the `connected_endpoint_tables` context + `content_full_width_page` template blocks in favor of
+    spreading `*get_connected_endpoint_panels("<model_name>")` into the view's `object_detail_content`.
+    """
+    # Imported lazily to avoid the import cycle described in `get_connected_endpoint_panels`.
+    from nautobot.core.utils.lookup import get_table_for_model
+
+    cable_paths = getattr(instance, "cable_paths", None)
+    if cable_paths is None:
+        return []
+
+    grouped = {}
+    for path in cable_paths.all():
+        destination = path.destination
+        if destination is None:
+            continue
+        grouped.setdefault(destination._meta.model_name, []).append(destination)
+
+    endpoint_tables = []
+    for endpoints in grouped.values():
+        table_class = get_table_for_model(endpoints[0])
+        if table_class is None:
+            continue
+        endpoint_tables.append(
+            {
+                "heading": f"{bettertitle(endpoints[0]._meta.verbose_name)} Endpoints",
+                "table": table_class(
+                    data=endpoints, orderable=False, exclude=("pk", "actions", "connection", "cable_peer")
+                ),
+            }
+        )
+    return endpoint_tables
+
+
+def get_connected_endpoint_panels(source_model_name, *, weight=200, section=None):
+    """Build one `ConnectedEndpointsPanel` per endpoint type a termination can connect to.
+
+    The candidate types come from `COMPATIBLE_TERMINATION_TYPES[source_model_name]`, intersected with
+    the registered `PathEndpoint` subclasses -- only `PathEndpoint`s can be the destination of a
+    `CablePath`, so non-PathEndpoint compatible types (e.g. front/rear ports) are skipped. Each panel
+    hides itself when the termination has no connected endpoints of its type.
+
+    Args:
+        source_model_name (str): The `model_name` of the termination type whose detail view this is,
+            e.g. "interface" or "circuittermination".
+        weight (int): The weight of the first panel; subsequent panels increment from here so they
+            render in `COMPATIBLE_TERMINATION_TYPES` order.
+        section (str, optional): A `SectionChoices` value for the panels. Defaults to `FULL_WIDTH`.
+
+    Returns:
+        (list): A list of `ConnectedEndpointsPanel` instances, suitable for spreading into an
+        `ObjectDetailContent`'s `panels`.
+    """
+    # Imported lazily: this module is imported during model loading (dcim.fields -> dcim.lookups ->
+    # dcim.utils), so importing the UI/lookup/model layers at the top of the file would cycle.
+    from nautobot.core.ui.choices import SectionChoices
+    from nautobot.core.ui.object_detail import ConnectedEndpointsPanel
+    from nautobot.core.utils.lookup import get_table_for_model
+    from nautobot.dcim.models import PathEndpoint
+
+    if section is None:
+        section = SectionChoices.FULL_WIDTH
+
+    path_endpoint_models = {
+        model._meta.model_name: model for model in apps.get_models() if issubclass(model, PathEndpoint)
+    }
+
+    panels = []
+    for index, endpoint_type in enumerate(COMPATIBLE_TERMINATION_TYPES.get(source_model_name, [])):
+        model = path_endpoint_models.get(endpoint_type)
+        if model is None:
+            continue
+        table_class = get_table_for_model(model)
+        if table_class is None:
+            continue
+        panels.append(
+            ConnectedEndpointsPanel(
+                table_class=table_class,
+                table_title=f"{bettertitle(model._meta.verbose_name)} Endpoints",
+                section=section,
+                weight=weight + index,
+                exclude_columns=["connection", "cable_peer"],
+            )
+        )
+    return panels

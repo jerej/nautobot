@@ -21,6 +21,7 @@ from django.urls.exceptions import NoReverseMatch
 from django.utils.cache import patch_vary_headers
 from django.utils.dateparse import parse_datetime
 from django.utils.encoding import iri_to_uri
+from django.utils.formats import date_format
 from django.utils.html import format_html, format_html_join
 from django.utils.http import url_has_allowed_host_and_scheme
 from django.utils.timezone import get_current_timezone, now
@@ -97,7 +98,7 @@ from nautobot.dcim.tables import (
 )
 from nautobot.extras.constants import PENDING_WORKFLOWS_ERROR_CODE
 from nautobot.extras.context_managers import deferred_change_logging_for_bulk_operation
-from nautobot.extras.jobs_revoke import RevokeFactory
+from nautobot.extras.jobs_cancel import CancelFactory, user_can_cancel_job_result
 from nautobot.extras.templatetags.approvals import render_approval_workflow_state
 from nautobot.extras.utils import (
     fixup_filterset_query_params,
@@ -106,8 +107,8 @@ from nautobot.extras.utils import (
     get_pending_approval_workflow_stages,
     get_worker_count,
 )
-from nautobot.ipam.models import IPAddress, Prefix, VLAN
-from nautobot.ipam.tables import IPAddressTable, PrefixTable, VLANTable
+from nautobot.ipam.models import IPAddress, IPAddressRange, Prefix, VLAN
+from nautobot.ipam.tables import IPAddressRangeTable, IPAddressTable, PrefixTable, VLANTable
 from nautobot.virtualization.models import VirtualMachine, VMInterface
 from nautobot.virtualization.tables import VirtualMachineTable, VMInterfaceTable
 from nautobot.vpn.models import VPN, VPNProfile, VPNTunnel, VPNTunnelEndpoint
@@ -701,20 +702,6 @@ class ApprovalWorkflowStageUIViewSet(
         instance.refresh_from_db()
         messages.success(request, f"You commented {instance}.")
         return redirect(self.get_return_url(request))
-
-
-class ApprovalWorkflowStageResponseUIViewSet(
-    ObjectBulkDestroyViewMixin,
-    ObjectDestroyViewMixin,
-):
-    """ViewSet for ApprovalWorkflowStageResponse."""
-
-    filterset_class = filters.ApprovalWorkflowStageResponseFilterSet
-    filterset_form_class = forms.ApprovalWorkflowStageResponseFilterForm
-    queryset = ApprovalWorkflowStageResponse.objects.all()
-    serializer_class = serializers.ApprovalWorkflowStageResponseSerializer
-    table_class = tables.ApprovalWorkflowStageResponseTable
-    object_detail_content = None
 
 
 class ApproverDashboardView(ObjectListViewMixin):
@@ -1383,6 +1370,7 @@ class CustomFieldUIViewSet(NautobotUIViewSet):
                 section=SectionChoices.LEFT_HALF,
                 fields="__all__",
                 exclude_fields=["content_types", "validation_minimum", "validation_maximum", "validation_regex"],
+                value_transforms={"description": [helpers.render_markdown, helpers.placeholder]},
             ),
             object_detail.DataTablePanel(
                 weight=200,
@@ -1770,6 +1758,9 @@ class DynamicGroupUIViewSet(NautobotUIViewSet):
                     "per_page": get_paginate_count(request),
                 }
                 RequestConfig(request, paginate).configure(members_table)
+
+                if "actions" in members_table.columns:
+                    members_table.columns["actions"].column.extra_context["return_url"] = ""
 
                 if instance.group_type != DynamicGroupTypeChoices.TYPE_STATIC:
                     context["members_list_url"] = None
@@ -2421,6 +2412,7 @@ class JobUIViewSet(NautobotUIViewSet):
                     "module_name",
                     "job_class_name",
                     "class_path",
+                    "source_version",
                     "installed",
                     "is_job_hook_receiver",
                     "is_job_button_receiver",
@@ -2534,12 +2526,39 @@ class JobUIViewSet(NautobotUIViewSet):
 
     def _handle_approval_workflow_response(self, request, scheduled_job, return_url):
         """Handle response for jobs requiring approval workflow."""
+        approval_url = reverse("extras:scheduledjob_approvalworkflow", args=[scheduled_job.pk])
+        htmx_trigger = request.headers.get("HX-Trigger", None)
+        if request.headers.get("HX-Request", False) and htmx_trigger == "job-form-modal":
+            messages.success(
+                request,
+                format_html(
+                    "Job '{}' successfully submitted for approval. <a href=\"{}\">View Approval Request</a>",
+                    scheduled_job.name,
+                    approval_url,
+                ),
+            )
+            response = render(request, "extras/htmx/job_modal_close.html")
+            patch_vary_headers(response, ["HX-Request"])
+            return response
         messages.success(request, f"Job '{scheduled_job.name}' successfully submitted for approval")
-        return redirect(return_url or reverse("extras:scheduledjob_approvalworkflow", args=[scheduled_job.pk]))
+        return redirect(return_url or approval_url)
 
     def _handle_scheduled_job_response(self, request, scheduled_job, return_url):
         """Handle response for successfully scheduled jobs."""
-        messages.success(request, f"Job {scheduled_job.name} successfully scheduled")
+        htmx_trigger = request.headers.get("HX-Trigger", None)
+        if request.headers.get("HX-Request", False) and htmx_trigger == "job-form-modal":
+            messages.success(
+                request,
+                format_html(
+                    "Job '{}' successfully scheduled. <a href=\"{}\">View Scheduled Job</a>",
+                    scheduled_job.name,
+                    scheduled_job.get_absolute_url(),
+                ),
+            )
+            response = render(request, "extras/htmx/job_modal_close.html")
+            patch_vary_headers(response, ["HX-Request"])
+            return response
+        messages.success(request, f"Job '{scheduled_job.name}' successfully scheduled")
         return redirect(return_url or "extras:scheduledjob_list")
 
     def _handle_immediate_execution(
@@ -2618,6 +2637,22 @@ class JobUIViewSet(NautobotUIViewSet):
                 )
         return template_name
 
+    def _resolve_enable_scheduling(self, request, job_model):
+        """Determine whether the job modal should render the scheduling form.
+
+        The setting is sourced exclusively from the server-side `_JobModalButton` component, looked up from
+        the registry using the `button_id` carried in the request. The request payload's `enable_scheduling`
+        value is never trusted: an unregistered (or missing) `button_id` resolves to `False`. Scheduling is
+        always disabled for jobs flagged with sensitive variables, regardless of the component setting.
+        """
+        if job_model.has_sensitive_variables:
+            return False
+        button_id = request.POST.get("job_modal_button", "")
+        job_modal_button = registry["job_modal_buttons"].get(button_id) if button_id else None
+        if job_modal_button is None:
+            return False
+        return bool(job_modal_button.enable_scheduling)
+
     def _render_response(self, request, job_model, job_class, job_form, job_execution_form, schedule_form):
         """Helper function to render the appropriate response, including handling HTMX modals."""
         htmx_request = self.request.headers.get("HX-Request", False)
@@ -2631,7 +2666,21 @@ class JobUIViewSet(NautobotUIViewSet):
             refresh_on_close_if_done = request.POST.get("refresh_on_close_if_done", "false")
             advanced_field_names = request.POST.getlist("advanced_fields")
             advanced_fields = [job_form[name] for name in advanced_field_names if name in job_form.fields]
+            enable_scheduling = self._resolve_enable_scheduling(request, job_model)
             template_name = self._get_template_name(job_class=job_class, htmx_modal=True)
+            hx_vals_dict = {
+                "job_modal_button": job_modal_button_registry_id,
+                "job_form_modal": True,
+                "job_result_key": job_result_key,
+                "run_button_label": run_button_label,
+                "refresh_on_close_if_done": refresh_on_close_if_done,
+                "advanced_fields": advanced_field_names,
+            }
+            # When scheduling is disabled, force immediate execution by injecting _schedule_type into hx-vals.
+            # When scheduling is enabled, omit it so that the form's <select> value is submitted unchanged
+            # (hx-vals would override the form field with the same name if present).
+            if not enable_scheduling:
+                hx_vals_dict["_schedule_type"] = JobExecutionType.TYPE_IMMEDIATELY
             response = render(
                 request,
                 template_name,
@@ -2645,17 +2694,8 @@ class JobUIViewSet(NautobotUIViewSet):
                     "advanced_field_names": advanced_field_names,
                     "job_execution_form": job_execution_form,
                     "schedule_form": schedule_form,
-                    "hx_vals": json.dumps(
-                        {
-                            "job_modal_button": job_modal_button_registry_id,
-                            "job_form_modal": True,
-                            "job_result_key": job_result_key,
-                            "run_button_label": run_button_label,
-                            "refresh_on_close_if_done": refresh_on_close_if_done,
-                            "advanced_fields": advanced_field_names,
-                            "_schedule_type": JobExecutionType.TYPE_IMMEDIATELY,
-                        }
-                    ),
+                    "enable_scheduling": enable_scheduling,
+                    "hx_vals": json.dumps(hx_vals_dict),
                 },
             )
         else:
@@ -2733,7 +2773,10 @@ class JobUIViewSet(NautobotUIViewSet):
             initial_form_data = normalize_querydict(request.POST, form_class=job_class.as_form_class())
             job_form = job_class.as_form(initial=initial_form_data)
             job_execution_form = job_class.as_execution_form(initial=initial_form_data)
-            schedule_form = None
+            if self._resolve_enable_scheduling(request, job_model):
+                schedule_form = forms.JobScheduleForm(initial=initial_form_data)
+            else:
+                schedule_form = None
             return self._render_response(request, job_model, job_class, job_form, job_execution_form, schedule_form)
 
         if job_execution_form is not None:
@@ -3206,6 +3249,99 @@ class ScheduledJobUIViewSet(
         )
     ]
 
+    @staticmethod
+    def render_state(value):
+        badges = {
+            ScheduledJobStateChoices.DENIED: ("bg-danger", "Approval Denied"),
+            ScheduledJobStateChoices.CANCELED: ("bg-danger", "Approval Canceled"),
+            ScheduledJobStateChoices.PENDING: ("bg-warning border", "Pending Approval"),
+            ScheduledJobStateChoices.ACTIVE: ("bg-info", "Active"),
+            ScheduledJobStateChoices.COMPLETED: ("bg-success", "Completed"),
+            ScheduledJobStateChoices.ERRORED: ("bg-danger", "Errored"),
+        }
+        if value in badges:
+            css_class, label = badges[value]
+            return format_html('<span class="badge {}">{}</span>', css_class, label)
+        return format_html('<span class="badge bg-body-secondary border">{}</span>', bettertitle(value))
+
+    class ScheduledJobFieldsPanel(object_detail.ObjectFieldsPanel):
+        """Object fields panel that renders the scheduled-job-specific fields with their custom formatting."""
+
+        @staticmethod
+        def _render_datetime(value, obj_tz, default_tz):
+            obj_local = date_format(value.astimezone(obj_tz), "SHORT_DATETIME_FORMAT")
+            if obj_tz == default_tz:
+                return format_html("{}", obj_local)
+            default_local = date_format(value.astimezone(default_tz), "SHORT_DATETIME_FORMAT")
+            return format_html("{} {}<br>{} {}", obj_local, obj_tz, default_local, default_tz)
+
+        def render_value(self, key, value, context):
+            if key == "task":
+                return format_html("<code>{}</code>", value)
+            obj = get_obj_from_context(context)
+            if key == "interval":
+                if value == JobExecutionType.TYPE_CUSTOM and obj.crontab:
+                    return format_html("{} ({})", value, obj.crontab)
+                return value
+            if key in ("start_time", "last_run_at"):
+                if not value:
+                    return helpers.HTML_NONE
+                return self._render_datetime(value, obj.time_zone, context["default_time_zone"])
+            return super().render_value(key, value, context)
+
+    class UserInputsPanel(object_detail.KeyValueTablePanel):
+        def should_render(self, context):
+            return bool(context.get("job_class_found"))
+
+        def get_data(self, context):
+            obj = get_obj_from_context(context)
+            labels = context.get("labels", {})
+            return {labels.get(key, key): value for key, value in obj.kwargs.items()}
+
+        def render_value(self, key, value, context):
+            if value is None:
+                return helpers.HTML_NONE
+            return format_html("<code>{}</code>", value)
+
+    object_detail_content = object_detail.ObjectDetailContent(
+        panels=(
+            ScheduledJobFieldsPanel(
+                weight=100,
+                section=SectionChoices.LEFT_HALF,
+                fields=("name", "description", "task", "job_model", "user", "approval_required", "decision_date"),
+                key_transforms={"decision_date": "Decision Date", "user": "Requester"},
+            ),
+            ScheduledJobFieldsPanel(
+                label="Scheduling",
+                weight=200,
+                section=SectionChoices.LEFT_HALF,
+                fields=(
+                    "enabled",
+                    "state",
+                    "job_queue",
+                    "interval",
+                    "one_off",
+                    "start_time",
+                    "last_run_at",
+                    "total_run_count",
+                ),
+                value_transforms={"state": [render_state]},
+            ),
+            UserInputsPanel(
+                label="User Inputs",
+                weight=100,
+                section=SectionChoices.RIGHT_HALF,
+            ),
+            object_detail.ObjectTextPanel(
+                weight=200,
+                label="Celery Keyword Arguments",
+                section=SectionChoices.RIGHT_HALF,
+                object_field="celery_kwargs",
+                render_as=object_detail.ObjectTextPanel.RenderOptions.JSON,
+            ),
+        )
+    )
+
     def get_extra_context(self, request, instance):
         context = super().get_extra_context(request, instance)
 
@@ -3378,12 +3514,12 @@ def render_jobresult_status(status):
     )
 
 
-def render_jobresult_revocation_type(revocation_type):
+def render_jobresult_cancel_type(cancel_type):
     """
-    Render a Bootstrap-style label for a JobRevocationType.
+    Render a Bootstrap-style label for a JobCancelType.
 
     Args:
-        revocation_type (str): The job result revocation type (e.g., "terminated", "reaped", etc.).
+        cancel_type (str): The job result cancel type (e.g., "terminated", "reaped", etc.).
 
     Returns:
         str: Safe HTML string for a styled label with a fixed ID so tests work.
@@ -3394,9 +3530,9 @@ def render_jobresult_revocation_type(revocation_type):
         "abandoned": ("bg-body-secondary border", "Abandoned"),
     }
 
-    css_class, text = mapping.get(revocation_type, ("bg-body-secondary border", f"{revocation_type} (unrecognized)"))
+    css_class, text = mapping.get(cancel_type, ("bg-body-secondary border", f"{cancel_type} (unrecognized)"))
     return format_html(
-        '<span id="revocation-type-label"><span class="badge {}">{}</span></span>',
+        '<span id="cancel-type-label"><span class="badge {}">{}</span></span>',
         css_class,
         text,
     )
@@ -3411,8 +3547,6 @@ class JobResultSummaryPanel(object_detail.ObjectFieldsPanel):
                 return format_html('<div class="spinner-border"><span class="visually-hidden">Loading...</span></div>')
         if key == "result" and value is None:
             return helpers.placeholder(value)  # instead of an explicitly rendered `null`
-        if key == "result" and obj.status != JobResultStatusChoices.STATUS_SUCCESS:
-            return helpers.placeholder(None)  # not render Result Data field
         return super().render_value(key, value, context)
 
 
@@ -3471,7 +3605,7 @@ class JobResultJobConsoleEntriesTab(object_detail.DistinctViewTab):
         return False
 
 
-class RevocationPanel(object_detail.ObjectFieldsPanel):
+class JobResultCancelPanel(object_detail.ObjectFieldsPanel):
     def should_render(self, context):
         return context["object"].status == JobResultStatusChoices.STATUS_REVOKED
 
@@ -3573,19 +3707,22 @@ class JobResultUIViewSet(
             ),
             JobResultButton(
                 weight=140,
-                label="Revoke Job",
+                label="Cancel Job",
                 color=ButtonActionColorChoices.DELETE,
                 icon="mdi-close-circle",
-                required_permissions=["extras.run_job"],
+                # No required_permissions: the submitter can cancel without cancel_job,
+                # so there is no single permission that gates the button. The real rule
+                # (submitter OR object-level cancel_job) lives in user_can_cancel_job_result,
+                # enforced here for rendering and again in the view.
                 link_name=lambda ctx: (
-                    reverse("extras:jobresult_revoke_job", kwargs={"pk": ctx["object"].pk})
+                    reverse("extras:jobresult_cancel_job", kwargs={"pk": ctx["object"].pk})
                     if (
                         ctx["object"].is_unready_state
-                        and (ctx["object"].user == ctx["request"].user or ctx["request"].user.is_staff)
+                        and user_can_cancel_job_result(ctx["request"].user, ctx["object"])
                     )
                     else None
                 ),
-                template_path="extras/inc/jobresult_revokejobbutton.html",
+                template_path="extras/inc/jobresult_canceljobbutton.html",
             ),
         ),
         extra_tabs=[
@@ -3626,17 +3763,17 @@ class JobResultUIViewSet(
             object_field="celery_kwargs",
             render_as=object_detail.ObjectTextPanel.RenderOptions.JSON,
         ),
-        RevocationPanel(
-            label="Revocation",
+        JobResultCancelPanel(
+            label="Cancel Details",
             section=SectionChoices.RIGHT_HALF,
             weight=100,
             fields=[
-                "date_revoked",
-                "revoked_by_user_name",
-                "revocation_type",
+                "date_canceled",
+                "canceled_by_user_name",
+                "cancel_type",
             ],
             value_transforms={
-                "revocation_type": [render_jobresult_revocation_type],
+                "cancel_type": [render_jobresult_cancel_type],
             },
         ),
         object_detail.ObjectFieldsPanel(
@@ -3649,6 +3786,8 @@ class JobResultUIViewSet(
                 "task_name",
                 "meta",
             ],
+            # Poll for updates while the job is running so worker details populate without a manual refresh.
+            body_wrapper_template_path="extras/inc/jobresult_summary_panel.html",
         ),
         object_detail.ObjectTextPanel(
             label="Traceback",
@@ -3656,6 +3795,8 @@ class JobResultUIViewSet(
             weight=300,
             object_field="traceback",
             render_as=object_detail.ObjectTextPanel.RenderOptions.CODE,
+            # Poll for updates so the traceback populates when the job finishes without a manual refresh.
+            body_wrapper_template_path="extras/inc/jobresult_polling_text_panel.html",
         ),
     )
 
@@ -3885,23 +4026,19 @@ class JobResultUIViewSet(
     @action(
         detail=True,
         methods=["get", "post"],
-        url_path="revoke-job",
-        url_name="revoke_job",
+        url_path="cancel-job",
+        url_name="cancel_job",
         custom_view_base_action="view",
     )
-    def revoke_job(self, request, pk=None):
+    def cancel_job(self, request, pk=None):
         """Terminate a running or pending Job, or reap it if its worker is gone."""
         job_result = self.get_object()
 
-        if not request.user.has_perm("extras.run_job"):
-            messages.error(request, "Job can not be revoked by user without permission to run jobs.")
+        if not user_can_cancel_job_result(request.user, job_result):
+            messages.error(request, "You do not have permission to cancel this job.")
             return redirect(job_result.get_absolute_url())
 
-        if job_result.user != request.user and not request.user.is_staff:
-            messages.error(request, "Job can be revoked only by the submitter or by staff users.")
-            return redirect(job_result.get_absolute_url())
-
-        strategy = RevokeFactory.get_strategy(job_result.queue_type)
+        strategy = CancelFactory.get_strategy(job_result.queue_type)
 
         if not job_result.is_unready_state:
             messages.info(request, "Job is already finished. Nothing to do.")
@@ -3911,7 +4048,7 @@ class JobResultUIViewSet(
         if request.method == "GET":
             return render(
                 request,
-                "extras/job_revoke.html",
+                "extras/job_cancel.html",
                 {
                     "object": job_result,
                     "job_liveness_state": job_liveness_state,
@@ -3920,14 +4057,14 @@ class JobResultUIViewSet(
                 },
             )
 
-        result = strategy.revoke(job_result, user=request.user)
+        result = strategy.cancel(job_result, user=request.user)
         if result["error"]:
             messages.error(request, result["error"])
         else:
-            if result["revoked"]:
-                messages.success(request, "Job revoked.")
+            if result["canceled"]:
+                messages.success(request, "Job canceled.")
             else:
-                messages.info(request, "Job finished before it could be revoked. No action was taken.")
+                messages.info(request, "Job finished before it could be canceled. No action was taken.")
 
         return redirect(job_result.get_absolute_url())
 
@@ -4570,6 +4707,13 @@ class RoleUIViewSet(viewsets.NautobotUIViewSet):
                 ipaddress_table.columns.hide("role")
                 RequestConfig(request, paginate).configure(ipaddress_table)
                 context["ipaddress_table"] = ipaddress_table
+
+            if ContentType.objects.get_for_model(IPAddressRange) in context["content_types"]:
+                ip_address_ranges = instance.ip_address_ranges.restrict(request.user, "view")
+                ip_address_range_table = IPAddressRangeTable(ip_address_ranges)
+                ip_address_range_table.columns.hide("role")
+                RequestConfig(request, paginate).configure(ip_address_range_table)
+                context["ip_address_range_table"] = ip_address_range_table
 
             if ContentType.objects.get_for_model(Prefix) in context["content_types"]:
                 prefixes = instance.prefixes.restrict(request.user, "view")

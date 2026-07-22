@@ -33,6 +33,7 @@ from nautobot.dcim.choices import (
     SoftwareImageFileHashingAlgorithmChoices,
     SubdeviceRoleChoices,
 )
+from nautobot.dcim.component_creation import SkipAutoComponentCreation
 from nautobot.dcim.constants import (
     CABLE_BREAKOUT_MAX_CONNECTORS,
     CABLE_BREAKOUT_MAX_LANES,
@@ -49,9 +50,11 @@ from nautobot.dcim.models import (
     DeviceFamily,
     DeviceRedundancyGroup,
     DeviceType,
+    DeviceTypeToSoftwareImageFile,
     FrontPortTemplate,
     Interface,
     InterfaceTemplate,
+    InterfaceVDCAssignment,
     Location,
     LocationType,
     Manufacturer,
@@ -75,6 +78,7 @@ from nautobot.dcim.models import (
 from nautobot.dcim.utils import generate_cable_breakout_mapping
 from nautobot.extras.models import ExternalIntegration, Role, Status
 from nautobot.extras.utils import FeatureQuery
+from nautobot.ipam.factory import VRFDeviceAssignmentFactory
 from nautobot.ipam.models import Prefix, VLAN, VLANGroup, VRF
 from nautobot.tenancy.models import Tenant
 from nautobot.virtualization.models import Cluster
@@ -149,7 +153,7 @@ def get_random_software_version_for_device_type(device_type):
 class CableTypeFactory(PrimaryModelFactory):
     class Meta:
         model = CableType
-        exclude = ("has_description", "has_manufacturer", "has_part_number")
+        exclude = ("has_description", "has_manufacturer", "has_part_number", "has_breakout")
 
     name = UniqueFaker("word")
     has_description = NautobotBoolIterator()
@@ -160,10 +164,21 @@ class CableTypeFactory(PrimaryModelFactory):
     part_number = factory.Maybe("has_part_number", UniqueFaker("bothify", text="???-####"), "")
     has_embedded_transceivers = NautobotBoolIterator()
 
-    a_connectors = factory.Faker("pyint", min_value=1, max_value=CABLE_BREAKOUT_MAX_CONNECTORS)
+    has_breakout = NautobotBoolIterator()
+
+    a_connectors = factory.LazyAttribute(
+        lambda o: factory.random.randgen.randint(
+            1,
+            (CABLE_BREAKOUT_MAX_CONNECTORS - 1) if o.has_breakout else CABLE_BREAKOUT_MAX_CONNECTORS,
+        )
+    )
     # Model requires a_connectors <= b_connectors
     b_connectors = factory.LazyAttribute(
-        lambda o: factory.random.randgen.randint(o.a_connectors, CABLE_BREAKOUT_MAX_CONNECTORS)
+        lambda o: (
+            factory.random.randgen.randint(o.a_connectors + 1, CABLE_BREAKOUT_MAX_CONNECTORS)
+            if o.has_breakout
+            else o.a_connectors
+        )
     )
     # total_lanes must be a multiple of lcm(a_connectors, b_connectors) and within the global max
     total_lanes = factory.LazyAttribute(
@@ -309,6 +324,29 @@ class DeviceFactory(PrimaryModelFactory):
     #     random_instance(lambda: IPAddress.objects.filter(ip_version=6), allow_null=False),
     # )
 
+    @classmethod
+    def _create(cls, model_class, *args, **kwargs):
+        with SkipAutoComponentCreation():
+            device = super()._create(model_class, *args, **kwargs)
+
+        for queryset in [
+            device.device_type.console_port_templates.all(),
+            device.device_type.console_server_port_templates.all(),
+            device.device_type.power_port_templates.all(),
+            device.device_type.power_outlet_templates.all(),
+            device.device_type.interface_templates.all(),
+            device.device_type.rear_port_templates.all(),
+            device.device_type.front_port_templates.all(),
+            device.device_type.device_bay_templates.all(),
+            device.device_type.module_bay_templates.all(),
+        ]:
+            for template_record in queryset:
+                record = template_record.instantiate(device=device)
+                record.pk = Faker().uuid4()
+                record.validated_save()
+
+        return device
+
 
 device_types = (
     "Router",
@@ -379,10 +417,15 @@ class DeviceTypeFactory(PrimaryModelFactory):
     def software_image_files(self, create, extracted, **kwargs):
         if not create:
             return
-        if extracted:
-            self.software_image_files.set(extracted)
-        else:
-            self.software_image_files.set(get_random_instances(SoftwareImageFile))
+        if not extracted:
+            extracted = get_random_instances(SoftwareImageFile)
+        for sif in extracted:
+            DeviceTypeToSoftwareImageFileFactory.create(device_type=self, software_image_file=sif)
+
+
+class DeviceTypeToSoftwareImageFileFactory(BaseModelFactory):
+    class Meta:
+        model = DeviceTypeToSoftwareImageFile
 
 
 class DeviceRedundancyGroupFactory(PrimaryModelFactory):
@@ -905,6 +948,28 @@ class ModuleFactory(PrimaryModelFactory):
     has_tenant = NautobotBoolIterator()
     tenant = factory.Maybe("has_tenant", random_instance(Tenant, allow_null=False), None)
 
+    @classmethod
+    def _create(cls, model_class, *args, **kwargs):
+        with SkipAutoComponentCreation():
+            module = super()._create(model_class, *args, **kwargs)
+
+        for queryset in [
+            module.module_type.console_port_templates.all(),
+            module.module_type.console_server_port_templates.all(),
+            module.module_type.power_port_templates.all(),
+            module.module_type.power_outlet_templates.all(),
+            module.module_type.interface_templates.all(),
+            module.module_type.rear_port_templates.all(),
+            module.module_type.front_port_templates.all(),
+            module.module_type.module_bay_templates.all(),
+        ]:
+            for template_record in queryset:
+                record = template_record.instantiate(device=module.device, module=module)
+                record.pk = Faker().uuid4()
+                record.validated_save()
+
+        return module
+
 
 class DeviceComponentTemplateFactory(BaseModelFactory):
     class Params:
@@ -1076,15 +1141,20 @@ class VirtualDeviceContextFactory(PrimaryModelFactory):
     @factory.post_generation
     def interfaces(self, create, extracted, **kwargs):
         if create:
-            if extracted:
-                self.interfaces.set(extracted)
-            else:
-                self.interfaces.set(get_random_instances(Interface.objects.filter(device=self.device)))
+            if not extracted:
+                extracted = get_random_instances(Interface.objects.filter(device=self.device))
+            for interface in extracted:
+                InterfaceVDCAssignmentFactory.create(virtual_device_context=self, interface=interface)
 
     @factory.post_generation
     def vrfs(self, create, extracted, **kwargs):
         if create:
-            if extracted:
-                self.vrfs.set(extracted)
-            else:
-                self.vrfs.set(get_random_instances(VRF.objects.all()))
+            if not extracted:
+                extracted = get_random_instances(VRF.objects.all())
+            for vrf in extracted:
+                VRFDeviceAssignmentFactory.create(virtual_device_context=self, vrf=vrf)
+
+
+class InterfaceVDCAssignmentFactory(BaseModelFactory):
+    class Meta:
+        model = InterfaceVDCAssignment

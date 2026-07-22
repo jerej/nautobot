@@ -1,5 +1,7 @@
 from collections import defaultdict
+from dataclasses import dataclass
 import logging
+from typing import Optional
 
 from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
@@ -7,11 +9,15 @@ from django.core.exceptions import ObjectDoesNotExist, ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models, transaction
 from django.db.models import Sum
+from django.urls import NoReverseMatch
 from django.utils.functional import classproperty
 
 from nautobot.core.constants import CHARFIELD_MAX_LENGTH
 from nautobot.core.models.fields import ColorField
+from nautobot.core.models.managers import BaseManager
+from nautobot.core.models.querysets import RestrictedQuerySet
 from nautobot.core.utils.data import to_meters
+from nautobot.core.utils.deprecation import warn_deprecated_at_caller
 from nautobot.dcim.choices import CableLengthUnitChoices, CableTypeChoices, CableTypePolarityMethodChoices
 from nautobot.dcim.constants import (
     BREAKOUT_COMPATIBLE_TERMINATION_TYPES,
@@ -23,8 +29,9 @@ from nautobot.dcim.constants import (
     TERMINATION_FK_TO_CONTENT_TYPE,
 )
 from nautobot.dcim.fields import JSONPathField
-from nautobot.dcim.svg.cable_breakout import BreakoutDiagramSVG
+from nautobot.dcim.svg.cable_breakout import BreakoutDiagramSVG, TerminationLabel
 from nautobot.dcim.utils import (
+    build_connector_row_layout,
     decompile_path_node,
     generate_cable_breakout_mapping,
     object_to_path_node,
@@ -41,16 +48,72 @@ from nautobot.extras.utils import extras_features
 # would be the much more invasive but much more "correct" fix.
 from nautobot.core.models.generics import BaseModel, PrimaryModel  # isort: skip
 
-from .device_components import FrontPort, RearPort
+from .device_components import CableTermination, FrontPort, RearPort
 
 __all__ = (
     "Cable",
+    "CableLane",
+    "CableLaneSide",
     "CablePath",
     "CableToCableTermination",
     "CableType",
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_absolute_url(obj):
+    """Return `obj.get_absolute_url()` or "" if the object exposes no resolvable URL."""
+    if obj is None:
+        return ""
+    try:
+        return obj.get_absolute_url()
+    except (AttributeError, NoReverseMatch):
+        return ""
+
+
+@dataclass(frozen=True)
+class CableLaneSide:
+    """One side (A or B) of a `CableLane`: its connector/position and resolved termination.
+
+    `termination` is the actual termination object (e.g. an `Interface`) or `None` when that
+    side of the lane is unconnected.
+    """
+
+    connector: int
+    position: int
+    termination: Optional[CableTermination]
+
+
+@dataclass(frozen=True)
+class CableLane:
+    """A single logical lane of a cable's connector mapping, with both sides' terminations resolved.
+
+    Note that multiple lanes which share a far-/near-side connector resolve to the same termination
+    object — the cable's mapping is what makes them distinct logical lanes, not the termination row.
+
+    Use `side()` to access a side by `cable_end` ("A"/"B") rather than reaching for the
+    `a_*`/`b_*` attributes by name; this keeps callers that work relative to a trunk/fan-out
+    side from constructing attribute names from strings.
+    """
+
+    lane: int
+    label: Optional[str]
+    a_connector: int
+    a_position: int
+    b_connector: int
+    b_position: int
+    a_termination: Optional[CableTermination]
+    b_termination: Optional[CableTermination]
+
+    def side(self, cable_end):
+        """Return the `CableLaneSide` for `cable_end` ("A" or "B", case-insensitive)."""
+        end = cable_end.lower()
+        return CableLaneSide(
+            connector=getattr(self, f"{end}_connector"),
+            position=getattr(self, f"{end}_position"),
+            termination=getattr(self, f"{end}_termination"),
+        )
 
 
 #
@@ -163,6 +226,29 @@ class CableType(PrimaryModel):
         """True if A-side and B-side connector counts differ."""
         return self.a_connectors != self.b_connectors
 
+    @property
+    def is_multi_connector(self):
+        """True if either side has more than one connector (i.e. multiple terminations per side).
+
+        Broader than `is_breakout`, which requires *differing* connector counts: a symmetric
+        multi-connector type such as a polarity-shuffled 2x2 is multi-connector but not a breakout.
+        Multi-connector cable types model per-lane terminations and therefore require breakout-eligible
+        termination types (see `Cable.breakout_eligible`).
+        """
+        return self.a_connectors > 1 or self.b_connectors > 1
+
+    @property
+    def trunk_end(self):
+        """The cable end (`"A"` or `"B"`) on the trunk (fewer-connectors) side of a breakout.
+
+        Returns `None` for non-breakout cable types. By model enforcement `a_connectors` never
+        exceeds `b_connectors`, so the trunk is always the A side for a real breakout, but this
+        is derived here rather than assumed by callers.
+        """
+        if not self.is_breakout:
+            return None
+        return "A" if self.a_connectors < self.b_connectors else "B"
+
     def get_diagram_svg(self):
         """Return SVG string for the lane mapping diagram (no connection status, all gray)."""
         diagram = BreakoutDiagramSVG(self.mapping, show_status=False)
@@ -230,6 +316,149 @@ class CableType(PrimaryModel):
 #
 
 
+class CableQuerySet(RestrictedQuerySet):
+    """
+    Add backward-compat translation for legacy `termination_[a|b]_type` / `termination_[a|b]_id` lookups.
+
+    This queryset rewrites those lookup kwargs on `filter()` and `exclude()` (and therefore `get()`,
+    which filters internally) into the equivalent `terminations__...` join lookups, constrained to
+    `connector=1` to mirror the Cable properties, emitting a `DeprecationWarning` for each. This keeps
+    `Cable.objects.get_or_create(termination_a_type=..., termination_a_id=..., ...)` and
+    `Cable.objects.filter(termination_a_id=...)` working for legacy callers: the lookup half is
+    translated here and, for `get_or_create()`, the create half flows through `Cable.__init__` into
+    `_materialize_initial_terminations`.
+
+    Supported lookup kwargs (exact-match only):
+
+    - `termination_a_type` / `termination_b_type` (`ContentType`),
+    - `termination_a_type_id` / `termination_b_type_id` (`ContentType` integer PK)
+    - `termination_a_id` / `termination_b_id` (UUID). A bare `*_id` without a matching `*_type` / `*_type_id` is matched
+      against every per-type FK (termination PKs are UUIDs, so this stays unambiguous).
+
+    NOT translated -- use the explicit `terminations__...` form for these:
+
+    - extended lookups such as `termination_a_id__in=...`
+    - `Q(termination_a_id=...)` and similar expressions
+    - `order_by("termination_a_type")` and similar
+    - `values("termination_a_id") / `values_list("termination_a_type")` and similar
+    - `select_related("termination_a_id")` / `prefetch_related("termination_a")` and similar
+    - `exclude(termination_a_id=..., termination_b_id=...)` - while accepted, combining both ends is applied per end
+      (`exclude(A) AND exclude(B)`), which is not identical to negating the combined condition.
+    """
+
+    _SIDES = {"a": "A", "b": "B"}
+
+    @staticmethod
+    def _warn(old, new):
+        warn_deprecated_at_caller(
+            f"Querying Cable by `{old}` is deprecated; use `{new}` instead. The `termination_a` / "
+            "`termination_b` generic foreign keys have been replaced by the `terminations` "
+            "(CableToCableTermination) relation."
+        )
+
+    @classmethod
+    def _extract_side_spec(cls, side, working):
+        """
+        Pop legacy `termination_<side>_type` / `termination_<side>_type_id` / `termination_<side>_id` kwargs from
+        `working` and return the matching `terminations__...` Q, or None if the side isn't referenced by a
+        translatable kwarg.
+
+        `termination_<side>_type_id` (integer `ContentType` PK) is accepted as an alternative to
+        `termination_<side>_type` (`ContentType` instance); if both are given they must resolve to the same object.
+
+        The legacy `*_type` / `*_type_id` / `*_id` columns were non-nullable, so an explicit `None` on any key never
+        matched a row -- even combined with a real value on another key (`type IS NULL AND id = <pk>`).
+        We preserve that in this deprecated code path (even though `terminations` is now nullable): any
+        present `None` yields a match-nothing Q for the side rather than being dropped (which would
+        silently widen the result set) or leaking a now-nonexistent field through to the queryset.
+        """
+        type_key = f"termination_{side}_type"
+        type_id_key = f"termination_{side}_type_id"
+        id_key = f"termination_{side}_id"
+        has_type = type_key in working
+        has_type_id = type_id_key in working
+        has_id = id_key in working
+        if not (has_type or has_type_id or has_id):
+            return None
+
+        cable_end = cls._SIDES[side]
+        # All constraints for one side share a single join (built up in one `.filter()`/`.exclude()`
+        # call) so they match the *same* CableToCableTermination row.
+        base = models.Q(terminations__cable_end=cable_end, terminations__connector=1)
+
+        term_type = working.pop(type_key, None)
+        term_type_id = working.pop(type_id_key, None)
+        term_id = working.pop(id_key, None)
+
+        # A present `None` reproduces the old `<col> IS NULL` on a non-nullable column -> matched
+        # nothing, and did so even alongside a real value on another key. Empty the whole side so
+        # `filter()` returns empty (and `get()` raises `DoesNotExist`) as before.
+        if (has_type and term_type is None) or (has_type_id and term_type_id is None) or (has_id and term_id is None):
+            return base & models.Q(pk__in=[])
+
+        # Resolve the effective `ContentType` from whichever of the two type forms was supplied, and
+        # record which key(s) were used so the deprecation warning names the caller's actual kwargs.
+        type_desc = type_key if has_type else None
+        if term_type_id is not None:
+            resolved = ContentType.objects.get_for_id(term_type_id)
+            if term_type is not None and term_type != resolved:
+                raise TypeError(f"Conflicting `{type_key}` and `{type_id_key}` values in Cable termination lookup")
+            term_type = resolved
+            type_desc = type_id_key if type_desc is None else f"{type_key}/{type_id_key}"
+
+        if term_type is not None:
+            try:
+                fk_field = CONTENT_TYPE_TO_TERMINATION_FK[(term_type.app_label, term_type.model)]
+            except KeyError:
+                raise TypeError(
+                    f"{term_type.app_label}.{term_type.model} is not a valid Cable termination type"
+                ) from None
+            if term_id is not None:
+                cls._warn(
+                    f"{type_desc}=..., {id_key}=...",
+                    f"terminations__{fk_field}_id=... with terminations__cable_end={cable_end!r}",
+                )
+                return base & models.Q(**{f"terminations__{fk_field}_id": term_id})
+            cls._warn(
+                f"{type_desc}=...", f"terminations__{fk_field}__isnull=False with terminations__cable_end={cable_end!r}"
+            )
+            return base & models.Q(**{f"terminations__{fk_field}__isnull": False})
+
+        # Else, a bare id (no type): match it against every per-type FK.
+        cls._warn(f"{id_key}=...", f"terminations__<type>_id=... with terminations__cable_end={cable_end!r}")
+        match = models.Q()
+        for fk_field in TERMINATION_FK_FIELDS:
+            match |= models.Q(**{f"terminations__{fk_field}_id": term_id})
+        return base & match
+
+    @classmethod
+    def _translate_termination_kwargs(cls, kwargs):
+        """Split `kwargs` into (passthrough field lookups, list of per-side `terminations__...` Q objects)."""
+        working = dict(kwargs)
+        side_qs = [q for side in cls._SIDES if (q := cls._extract_side_spec(side, working)) is not None]
+        return working, side_qs
+
+    def filter(self, *args, **kwargs):
+        passthrough, side_qs = self._translate_termination_kwargs(kwargs)
+        qs = super().filter(*args, **passthrough)
+        # Apply each side as its own call so the multi-valued `terminations` relation gets a separate
+        # join per side -- a single call would force one row to be both the A- and B-side termination.
+        for q in side_qs:
+            qs = qs.filter(q)
+        return qs
+
+    def exclude(self, *args, **kwargs):
+        passthrough, side_qs = self._translate_termination_kwargs(kwargs)
+        qs = super().exclude(*args, **passthrough) if (args or passthrough) else self.all()
+        for q in side_qs:
+            qs = qs.exclude(q)
+        return qs
+
+
+# Manager wired to the translation queryset; set as `Cable.objects` below.
+CableManager = BaseManager.from_queryset(CableQuerySet)
+
+
 @extras_features(
     "custom_links",
     "custom_validators",
@@ -246,6 +475,8 @@ class Cable(PrimaryModel):
     properties retrieve the A-side and B-side termination on connector 1 respectively for backward
     compatibility; use `terminations_a` / `terminations_b` to access all terminations on each side.
     """
+
+    objects = CableManager()
 
     cable_type = models.ForeignKey(
         to=CableType,
@@ -267,7 +498,8 @@ class Cable(PrimaryModel):
         blank=True,
     )
     # Stores the normalized length (in meters) for database ordering
-    _abs_length = models.DecimalField(max_digits=10, decimal_places=4, blank=True, null=True)
+    # max(length) = 65535, max(length_unit) = "km" --> max(_abs_length) = 65535000.0000
+    _abs_length = models.DecimalField(max_digits=13, decimal_places=4, blank=True, null=True)
 
     # Typed many-to-many accessors for each terminating model. The through model is
     # CableToCableTermination, which carries the cable_end / connector lane attributes.
@@ -339,10 +571,13 @@ class Cable(PrimaryModel):
         # Store them for post-save processing by signal handlers or forms.
         self._initial_termination_a = kwargs.pop("termination_a", None)
         self._initial_termination_b = kwargs.pop("termination_b", None)
-        # Also handle the type/id kwargs used by serializers and forms
+        # Also handle the type/id kwargs used by serializers and forms,
+        # as well as the type_id kwargs used by Design Builder and others.
         self._initial_termination_a_type = kwargs.pop("termination_a_type", None)
+        self._initial_termination_a_type_id = kwargs.pop("termination_a_type_id", None)
         self._initial_termination_a_id = kwargs.pop("termination_a_id", None)
         self._initial_termination_b_type = kwargs.pop("termination_b_type", None)
+        self._initial_termination_b_type_id = kwargs.pop("termination_b_type_id", None)
         self._initial_termination_b_id = kwargs.pop("termination_b_id", None)
 
         super().__init__(*args, **kwargs)
@@ -419,6 +654,18 @@ class Cable(PrimaryModel):
         self._initial_termination_a_type = value
 
     @property
+    def termination_a_type_id(self):
+        """PK of the ContentType of the A-side termination on connector 1 (backward compat)."""
+        ct = self._get_termination_attr("A", "termination_type", "_initial_termination_a_type")
+        if ct is not None:
+            return ct.pk
+        return getattr(self, "_initial_termination_a_type_id", None)
+
+    @termination_a_type_id.setter
+    def termination_a_type_id(self, value):
+        self._initial_termination_a_type_id = value
+
+    @property
     def termination_a_id(self):
         """UUID of the A-side termination on connector 1 (backward compat)."""
         return self._get_termination_attr("A", "termination_id", "_initial_termination_a_id")
@@ -435,6 +682,18 @@ class Cable(PrimaryModel):
     @termination_b_type.setter
     def termination_b_type(self, value):
         self._initial_termination_b_type = value
+
+    @property
+    def termination_b_type_id(self):
+        """PK of the ContentType of the B-side termination on connector 1 (backward compat)."""
+        ct = self._get_termination_attr("B", "termination_type", "_initial_termination_b_type")
+        if ct is not None:
+            return ct.pk
+        return getattr(self, "_initial_termination_b_type_id", None)
+
+    @termination_b_type_id.setter
+    def termination_b_type_id(self, value):
+        self._initial_termination_b_type_id = value
 
     @property
     def termination_b_id(self):
@@ -490,7 +749,12 @@ class Cable(PrimaryModel):
             termination = endpoint.termination
             if termination:
                 parent = getattr(termination, "parent", None)
-                label = f"{parent} / {termination}" if parent else str(termination)
+                label = TerminationLabel(
+                    term_text=str(termination),
+                    term_url=_safe_absolute_url(termination),
+                    parent_text=str(parent) if parent else "",
+                    parent_url=_safe_absolute_url(parent),
+                )
                 if endpoint.cable_end == "A":
                     connected_a.add(endpoint.connector)
                     a_labels[endpoint.connector] = label
@@ -500,7 +764,7 @@ class Cable(PrimaryModel):
         return connected_a, connected_b, a_labels, b_labels
 
     def get_mapping_diagram_svg(self):
-        """Return SVG string for the breakout lane mapping diagram with connection status and tooltips."""
+        """Return SVG string for the breakout lane mapping diagram with connection status and termination links."""
         if not self.cable_type_id:
             return ""
 
@@ -544,9 +808,9 @@ class Cable(PrimaryModel):
 
     def get_lanes(self):
         """
-        Return a list of lane dicts, each containing lane number, connector/position info, and
-        actual termination objects (or None for unconnected). Standard (non-breakout) cables
-        return a single-element list representing the implicit one-lane connection.
+        Return a list of `CableLane` instances, each carrying the lane number, connector/position
+        info, and actual termination objects (or None for unconnected). Standard (non-breakout)
+        cables return a single-element list representing the implicit one-lane connection.
 
         Note that multiple lanes which share a far-/near-side connector resolve to the same
         termination object — the cable's mapping is what makes them distinct logical lanes,
@@ -560,15 +824,16 @@ class Cable(PrimaryModel):
             a_endpoint = endpoint_lookup.get(("A", entry["a_connector"]))
             b_endpoint = endpoint_lookup.get(("B", entry["b_connector"]))
             lanes.append(
-                {
-                    "lane": lane_number,
-                    "a_connector": entry["a_connector"],
-                    "a_position": entry["a_position"],
-                    "b_connector": entry["b_connector"],
-                    "b_position": entry["b_position"],
-                    "a_termination": a_endpoint.termination if a_endpoint else None,
-                    "b_termination": b_endpoint.termination if b_endpoint else None,
-                }
+                CableLane(
+                    lane=lane_number,
+                    label=entry.get("label"),
+                    a_connector=entry["a_connector"],
+                    a_position=entry["a_position"],
+                    b_connector=entry["b_connector"],
+                    b_position=entry["b_position"],
+                    a_termination=a_endpoint.termination if a_endpoint else None,
+                    b_termination=b_endpoint.termination if b_endpoint else None,
+                )
             )
         return lanes
 
@@ -590,6 +855,8 @@ class Cable(PrimaryModel):
         cable_type = self.cable_type if self.cable_type_id else None
 
         def _build_connector_info(side, connector_number, position_count):
+            if connector_number is None:
+                return None
             endpoint = endpoint_by_connector.get((side, connector_number))
             return {
                 "connector": connector_number,
@@ -609,58 +876,49 @@ class Cable(PrimaryModel):
                 "b_connector_count": 1,
             }
 
-        # Build the mapping: which A connectors map to which B connectors
-        a_to_b_connectors = {}
-        b_to_a_connectors = {}
-        for entry in cable_type.mapping:
-            a_to_b_connectors.setdefault(entry["a_connector"], set()).add(entry["b_connector"])
-            b_to_a_connectors.setdefault(entry["b_connector"], set()).add(entry["a_connector"])
-
-        # Build a flat row list from the mapping, assigning rowspans.
-        # Each unique (a_connector, b_connector) pair gets one row.
-        rows = []
-        seen_a_connectors = {}  # a_connector → first row index
-        seen_b_connectors = {}  # b_connector → first row index
-        seen_pairs = set()
-
-        for entry in cable_type.mapping:
-            a_connector = entry["a_connector"]
-            b_connector = entry["b_connector"]
-            pair = (a_connector, b_connector)
-            if pair in seen_pairs:
-                continue
-            seen_pairs.add(pair)
-
-            a_info = _build_connector_info("A", a_connector, cable_type.a_positions)
-            b_info = _build_connector_info("B", b_connector, cable_type.b_positions)
-
-            a_rowspan = 0  # 0 = skip (covered by previous rowspan)
-            b_rowspan = 0
-
-            if a_connector not in seen_a_connectors:
-                a_rowspan = len(a_to_b_connectors.get(a_connector, []))
-                seen_a_connectors[a_connector] = len(rows)
-
-            if b_connector not in seen_b_connectors:
-                b_rowspan = len(b_to_a_connectors.get(b_connector, []))
-                seen_b_connectors[b_connector] = len(rows)
-
-            rows.append(
-                {
-                    "a": a_info,
-                    "b": b_info,
-                    "a_rowspan": a_rowspan,
-                    "b_rowspan": b_rowspan,
-                    "_a_connector": a_connector,
-                    "_b_connector": b_connector,
-                }
-            )
+        rows = [
+            {
+                "a": _build_connector_info("A", layout["a_connector"], cable_type.a_positions),
+                "b": _build_connector_info("B", layout["b_connector"], cable_type.b_positions),
+                "a_rowspan": layout["a_rowspan"],
+                "b_rowspan": layout["b_rowspan"],
+            }
+            for layout in build_connector_row_layout(cable_type.mapping)
+        ]
 
         return {
             "rows": rows,
             "is_breakout": True,
             "a_connector_count": cable_type.a_connectors,
             "b_connector_count": cable_type.b_connectors,
+        }
+
+    def get_connections_a(self):
+        data = self.get_connections()
+        return {
+            "rows": [
+                {
+                    "info": row["a"],
+                    "rowspan": row["a_rowspan"],
+                }
+                for row in data["rows"]
+            ],
+            "is_breakout": data["is_breakout"],
+            "connector_count": data["a_connector_count"],
+        }
+
+    def get_connections_b(self):
+        data = self.get_connections()
+        return {
+            "rows": [
+                {
+                    "info": row["b"],
+                    "rowspan": row["b_rowspan"],
+                }
+                for row in data["rows"]
+            ],
+            "is_breakout": data["is_breakout"],
+            "connector_count": data["b_connector_count"],
         }
 
     # ─── Validation ───
@@ -770,6 +1028,20 @@ class Cable(PrimaryModel):
         # persisted, not against the initial value captured in __init__.
         self._orig_status = self.status
 
+    def _resolve_initial_termination_type(self, side):
+        """Resolve the initial termination ContentType for `side` ("a"/"b") from `_type` or `_type_id`.
+
+        Prefers a supplied `ContentType` instance (`_initial_termination_<side>_type`); otherwise resolves
+        the integer PK form (`_initial_termination_<side>_type_id`). Returns None if neither was supplied.
+        """
+        ct = getattr(self, f"_initial_termination_{side}_type", None)
+        if ct is not None:
+            return ct
+        ct_id = getattr(self, f"_initial_termination_{side}_type_id", None)
+        if ct_id is not None:
+            return ContentType.objects.get_for_id(ct_id)
+        return None
+
     def _materialize_initial_terminations(self):
         """
         Create `CableToCableTermination` rows from any `_initial_termination_*` attrs supplied via
@@ -779,13 +1051,16 @@ class Cable(PrimaryModel):
         term_a = getattr(self, "_initial_termination_a", None)
         term_b = getattr(self, "_initial_termination_b", None)
 
-        # Also handle type/id kwargs for the case where termination objects aren't resolved yet.
-        if term_a is None and getattr(self, "_initial_termination_a_type", None):
-            ct = self._initial_termination_a_type
-            term_a = ct.model_class().objects.get(pk=self._initial_termination_a_id)
-        if term_b is None and getattr(self, "_initial_termination_b_type", None):
-            ct = self._initial_termination_b_type
-            term_b = ct.model_class().objects.get(pk=self._initial_termination_b_id)
+        # Also handle type/id kwargs for the case where termination objects aren't resolved yet. The
+        # ContentType may arrive as an instance (`_type`) or an integer PK (`_type_id`).
+        if term_a is None:
+            ct = self._resolve_initial_termination_type("a")
+            if ct is not None:
+                term_a = ct.model_class().objects.get(pk=self._initial_termination_a_id)
+        if term_b is None:
+            ct = self._resolve_initial_termination_type("b")
+            if ct is not None:
+                term_b = ct.model_class().objects.get(pk=self._initial_termination_b_id)
 
         # Determine lane 1 connector. Defaults to 1 (the only valid connector on each side for a
         # standard cable); breakout cables read the lane-1 connectors from mapping[0].
@@ -886,26 +1161,6 @@ def termination_fk_field(model_or_instance):
             f"{opts.label} is not a known CableTermination subclass; expected one of "
             f"{sorted(CONTENT_TYPE_TO_TERMINATION_FK)}"
         ) from None
-
-
-def _resolve_termination_device(termination):
-    """Return the effective parent Device of a termination, walking through any chain of nested modules."""
-    if termination is None:
-        return None
-    direct_device = getattr(termination, "device", None)
-    if direct_device is not None:
-        return direct_device
-    module = getattr(termination, "module", None)
-    while module is not None:
-        if module.device is not None:
-            return module.device
-        parent_bay = getattr(module, "parent_module_bay", None)
-        if parent_bay is None:
-            return None
-        if getattr(parent_bay, "parent_device", None) is not None:
-            return parent_bay.parent_device
-        module = getattr(parent_bay, "parent_module", None)
-    return None
 
 
 def _at_most_one_termination_q():
@@ -1024,17 +1279,6 @@ class CableToCableTermination(BaseModel):
         help_text="The connector number on this cable end. Always 1 for standard cables.",
     )
 
-    # Cached parent Device for filtering (resolved through any chain of nested modules at save time).
-    # Necessary denormalization: the effective device of a modular component is reached through a
-    # recursive parent_module_bay/parent_module chain, which can't be expressed as a single ORM JOIN.
-    _termination_device = models.ForeignKey(
-        to="dcim.Device",
-        on_delete=models.CASCADE,
-        related_name="+",
-        blank=True,
-        null=True,
-    )
-
     natural_key_field_names = ["pk"]
 
     class Meta:
@@ -1108,6 +1352,21 @@ class CableToCableTermination(BaseModel):
         if term is not None:
             validate_cable_termination(term, cable_id=self.cable_id)
 
+        # A multi-connector cable type models per-lane terminations, which only certain termination
+        # types support; reject e.g. a console or power termination on a breakout cable. Single-
+        # connector cable types (and standard cables with no cable_type) impose no such restriction.
+        if (
+            term is not None
+            and self.cable is not None
+            and self.cable.cable_type_id is not None
+            and self.cable.cable_type.is_multi_connector
+            and term._meta.model_name not in BREAKOUT_COMPATIBLE_TERMINATION_TYPES
+        ):
+            raise ValidationError(
+                f"A {term._meta.verbose_name} cannot terminate a multi-connector cable type; only "
+                "interfaces, front ports, rear ports, and circuit terminations support breakout."
+            )
+
         # `connector` must be in the range defined by the parent cable's CableType. Standard cables
         # (no CableType) have a single connector on each end, so `connector` must be 1; breakout
         # cables have `a_connectors`/`b_connectors` valid positions per side.
@@ -1154,11 +1413,6 @@ class CableToCableTermination(BaseModel):
                     if peer_term is None:
                         continue
                     Cable.validate_termination_pair(term, peer_term)
-
-    def save(self, *args, **kwargs):
-        # Cache the effective parent device for filtering. See `_termination_device` field comment.
-        self._termination_device = _resolve_termination_device(self.termination)
-        super().save(*args, **kwargs)
 
 
 @extras_features("graphql")
@@ -1210,6 +1464,13 @@ class CablePath(BaseModel):
         default=1,
         validators=[MinValueValidator(1), MaxValueValidator(CABLE_BREAKOUT_MAX_CONNECTORS)],
     )
+    # Whether this path's origin / destination sits on the fan-out (trunk) side of a breakout cable,
+    # i.e. its connector maps to more than one opposite-side connector (see
+    # `CableTermination.breakout_fans_out()`). Stamped at path-build time (a pure function of each
+    # endpoint + its cable type, so recomputed on every rebuild). Lets the Interface Connections list
+    # view canonicalize a breakout's lanes onto one side and group them without per-row subqueries.
+    origin_fans_out = models.BooleanField(default=False)
+    destination_fans_out = models.BooleanField(default=False)
     # `CablePathSerializer` currently does not inherit from `BaseModelSerializer`
     # thus it does not have `object_type` field needed for the `assigned_object` field using `PolymorphicProxySerializer`.
     is_metadata_associable_model = False
@@ -1228,6 +1489,39 @@ class CablePath(BaseModel):
     def segment_count(self):
         total_length = 1 + len(self.path) + (1 if self.destination else 0)
         return int(total_length / 3)
+
+    @classmethod
+    def interface_connections(cls):
+        """
+        Canonical queryset of interface-to-interface connections, one CablePath row per lane.
+
+        For a breakout cable the trunk interface is the origin of all N lanes; those are kept
+        (canonicalizing the trunk onto one side) and the reverse fan-out rows are dropped, while
+        point-to-point connections keep a single canonical direction:
+
+        - `origin_fans_out=True` — a trunk-origin lane; keep all N.
+        - `destination_fans_out=True` — a reverse fan-out row (its far endpoint is the trunk); drop it.
+        - Otherwise point-to-point; keep the single canonical direction (`origin_id < destination_id`).
+
+        Both flags are stored (see `from_origin`), so this is a plain indexed column filter with no
+        per-row subqueries. Rows are ordered so a trunk's lanes are consecutive. Shared by the UI
+        Interface Connections list view and the REST API `InterfaceConnectionViewSet` so they stay
+        consistent.
+        """
+        return (
+            cls.objects.filter(
+                origin_type__app_label="dcim",
+                origin_type__model="interface",
+                destination_type__app_label="dcim",
+                destination_type__model="interface",
+            )
+            .filter(
+                models.Q(origin_fans_out=True)
+                | (models.Q(destination_fans_out=False) & models.Q(origin_id__lt=models.F("destination_id")))
+            )
+            .order_by("origin_type", "origin_id", "peer_connector")
+            .prefetch_related("origin", "destination")
+        )
 
     @classmethod
     def from_origin(cls, origin, peer_connector=1):
@@ -1343,6 +1637,9 @@ class CablePath(BaseModel):
             is_active=is_active,
             is_split=is_split,
             peer_connector=peer_connector,
+            # Locally computed from each endpoint's own connector mapping; no sibling-row lookups.
+            origin_fans_out=origin.breakout_fans_out(),
+            destination_fans_out=destination.breakout_fans_out() if destination is not None else False,
         )
 
     def get_path(self):
@@ -1397,7 +1694,7 @@ class CablePath(BaseModel):
         """
         Return all available next segments in a split cable path.
 
-        A split path ends on one of two port types:
+        A split path ends on one of three terminal nodes:
 
         - A RearPort: the trace arrived on the rear face of a patch panel and the signal fans out
           internally to the panel's front ports, so those front ports are the next segments.
@@ -1405,8 +1702,13 @@ class CablePath(BaseModel):
           multiple lanes (see `CablePath.from_origin`), so the next segments are that cable's
           far-side lane terminations — onward across the cable, not the rear port behind the front
           port (which the trace has already traversed).
+        - A Cable: the origin sits on a breakout cable whose requested lane has no far-side
+          termination (a disconnected lane; `path=[cable]`, see `from_origin`). There is nowhere to
+          continue, so there are no next segments.
         """
         next_port = path_node_to_object(self.path[-1])
+        if isinstance(next_port, Cable):
+            return []
         if isinstance(next_port, RearPort):
             return FrontPort.objects.filter(rear_port=next_port)
         return next_port.get_cable_peers()

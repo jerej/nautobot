@@ -37,6 +37,7 @@ from nautobot.dcim.choices import (
 from nautobot.dcim.constants import NONCONNECTABLE_IFACE_TYPES
 from nautobot.dcim.models import (
     Cable,
+    CableLane,
     CablePath,
     CableToCableTermination,
     CableType,
@@ -82,6 +83,7 @@ from nautobot.dcim.models import (
     SoftwareVersion,
     VirtualDeviceContext,
 )
+from nautobot.dcim.models.device_component_templates import ModularComponentTemplateModel
 from nautobot.dcim.utils import generate_cable_breakout_mapping
 from nautobot.extras import context_managers
 from nautobot.extras.choices import CustomFieldTypeChoices
@@ -107,10 +109,19 @@ class ModularDeviceComponentTestCaseMixin:
         cls.module = Module.objects.first()
 
     def test_parent_validation_device_and_module(self):
-        """Assert that a modular component must have a parent device or parent module but not both."""
+        """Validate whether the current object's device reference is the same as the nested device reference in module/module_bay. Does not apply to TemplateTestCases"""
+        if issubclass(self.model, ModularComponentTemplateModel):
+            self.skipTest("Only applies to modular components - not modular templates.")
+
+        module = (
+            Module.objects.filter(parent_module_bay__parent_device__isnull=False)
+            .exclude(parent_module_bay__parent_device=self.device)
+            .first()
+        )
+
         instance = self.model(
             name=f"test {self.model._meta.model_name} 1",
-            **{self.device_field: self.device, self.module_field: self.module},
+            **{self.device_field: self.device, self.module_field: module},
             **self.modular_component_create_data,
         )
 
@@ -178,9 +189,6 @@ class ModularDeviceComponentTestCaseMixin:
 
         with self.assertRaises(ValidationError):
             instance.full_clean()
-
-        with self.assertRaises(IntegrityError):
-            instance.save()
 
     def test_uniqueness_module(self):
         """Assert that the combination of module and name is unique."""
@@ -381,7 +389,7 @@ class FrontPortTestCase(ModelTestCases.BaseModelTestCase):
 
     @classmethod
     def setUpTestData(cls):
-        cls.module = Module.objects.filter(rear_ports__isnull=False).first()
+        cls.module = Module.objects.filter(rear_ports__isnull=False, parent_module_bay__isnull=True).first()
         cls.module_rear_port = cls.module.rear_ports.first()
         module_used_positions = set(cls.module_rear_port.front_ports.values_list("rear_port_position", flat=True))
         cls.module_available_positions = set(range(1, cls.module_rear_port.positions + 1)).difference(
@@ -394,20 +402,6 @@ class FrontPortTestCase(ModelTestCases.BaseModelTestCase):
         cls.device_available_positions = set(range(1, cls.device_rear_port.positions + 1)).difference(
             device_used_positions
         )
-
-    def test_parent_validation_device_and_module(self):
-        """Assert that a modular component must have a parent device or parent module but not both."""
-        instance = self.model(
-            device=self.device,
-            module=self.module,
-            name=f"test {self.model._meta.model_name} 1",
-            type=PortTypeChoices.TYPE_8P8C,
-            rear_port=self.module_rear_port,
-            rear_port_position=self.module_available_positions.copy().pop(),
-        )
-
-        with self.assertRaises(ValidationError):
-            instance.full_clean()
 
     def test_parent_validation_no_device_or_module(self):
         """Assert that a modular component must have a parent device or parent module but not both."""
@@ -483,9 +477,6 @@ class FrontPortTestCase(ModelTestCases.BaseModelTestCase):
 
         with self.assertRaises(ValidationError):
             instance.full_clean()
-
-        with self.assertRaises(IntegrityError):
-            instance.save()
 
     def test_uniqueness_module(self):
         """Assert that the combination of module and name is unique."""
@@ -588,20 +579,6 @@ class FrontPortTemplateTestCase(ModelTestCases.BaseModelTestCase):
             device_used_positions
         )
 
-    def test_parent_validation_device_and_module(self):
-        """Assert that a modular component must have a parent device or parent module but not both."""
-        instance = self.model(
-            device_type=self.device_type,
-            module_type=self.module_type,
-            name=f"test {self.model._meta.model_name} 1",
-            type=PortTypeChoices.TYPE_8P8C,
-            rear_port_template=self.module_rear_port,
-            rear_port_position=self.module_available_positions.copy().pop(),
-        )
-
-        with self.assertRaises(ValidationError):
-            instance.full_clean()
-
     def test_parent_validation_no_device_or_module(self):
         """Assert that a modular component must have a parent device or parent module but not both."""
         instance = self.model(
@@ -676,9 +653,6 @@ class FrontPortTemplateTestCase(ModelTestCases.BaseModelTestCase):
 
         with self.assertRaises(ValidationError):
             instance.full_clean()
-
-        with self.assertRaises(IntegrityError):
-            instance.save()
 
     def test_uniqueness_module(self):
         """Assert that the combination of module and name is unique."""
@@ -2089,6 +2063,7 @@ class DeviceTestCase(ModelTestCases.BaseModelTestCase):
         self.assertIsNotNone(device.primary_ip4)
         device.primary_ip6 = interface.ip_addresses.all().filter(ip_version=6).first()
         self.assertIsNotNone(device.primary_ip6)
+
         device.validated_save()
 
     def test_software_version_device_type_validation(self):
@@ -2939,10 +2914,6 @@ class DeviceTypeToSoftwareImageFileTestCase(ModelTestCases.BaseModelTestCase):
 class CableTypeTestCase(ModelTestCases.BaseModelTestCase):
     model = CableType
 
-    def test_get_docs_url(self):
-        """Docs page for this model doesn't exist yet."""
-        # TODO: remove this override once a docs page is added for CableType.
-
     def test_derived_properties(self):
         breakout = CableType(
             name="Test 1-to-4",
@@ -3385,15 +3356,16 @@ class CableTestCase(ModelTestCases.BaseModelTestCase):
         self.assertEqual("", self.cable.get_mapping_diagram_svg())
         self.assertEqual(
             [
-                {
-                    "lane": 1,
-                    "a_connector": 1,
-                    "a_position": 1,
-                    "b_connector": 1,
-                    "b_position": 1,
-                    "a_termination": interface1,
-                    "b_termination": interface2,
-                },
+                CableLane(
+                    lane=1,
+                    label=None,
+                    a_connector=1,
+                    a_position=1,
+                    b_connector=1,
+                    b_position=1,
+                    a_termination=interface1,
+                    b_termination=interface2,
+                ),
             ],
             self.cable.get_lanes(),
         )
@@ -3410,8 +3382,10 @@ class CableTestCase(ModelTestCases.BaseModelTestCase):
 
         # Getters on a saved cable resolve through the first endpoint on each side.
         self.assertEqual(self.cable.termination_a_type, interface_ct)
+        self.assertEqual(self.cable.termination_a_type_id, interface_ct.pk)
         self.assertEqual(self.cable.termination_a_id, self.interface1.pk)
         self.assertEqual(self.cable.termination_b_type, interface_ct)
+        self.assertEqual(self.cable.termination_b_type_id, interface_ct.pk)
         self.assertEqual(self.cable.termination_b_id, self.interface2.pk)
 
         def assert_round_trip(cable):
@@ -3476,6 +3450,165 @@ class CableTestCase(ModelTestCases.BaseModelTestCase):
         self.assertEqual(via_type_id_setters.termination_b_type, rear_port_ct)
         self.assertEqual(via_type_id_setters.termination_b_id, self.rear_port1.pk)
         assert_round_trip(via_type_id_setters)
+
+        # Variant 4: `*_type_id` (integer ContentType PK) kwargs -- the Django `<gfk>_id` convention.
+        via_type_pk = Cable(
+            termination_a_type_id=interface_ct.pk,
+            termination_a_id=self.interface3.pk,
+            termination_b_type_id=rear_port_ct.pk,
+            termination_b_id=self.rear_port1.pk,
+            status=self.status,
+        )
+        # The `*_type_id` getter reports the PK, and `*_type` stays None until save resolves the join rows.
+        self.assertEqual(via_type_pk.termination_a_type_id, interface_ct.pk)
+        self.assertEqual(via_type_pk.termination_a_id, self.interface3.pk)
+        self.assertEqual(via_type_pk.termination_b_type_id, rear_port_ct.pk)
+        self.assertEqual(via_type_pk.termination_b_id, self.rear_port1.pk)
+        assert_round_trip(via_type_pk)
+
+        # Variant 5: direct attribute assignment via the `*_type_id` setters.
+        via_type_pk_setters = Cable(status=self.status)
+        via_type_pk_setters.termination_a_type_id = interface_ct.pk
+        via_type_pk_setters.termination_a_id = self.interface3.pk
+        via_type_pk_setters.termination_b_type_id = rear_port_ct.pk
+        via_type_pk_setters.termination_b_id = self.rear_port1.pk
+        self.assertEqual(via_type_pk_setters.termination_a_type_id, interface_ct.pk)
+        self.assertEqual(via_type_pk_setters.termination_b_type_id, rear_port_ct.pk)
+        assert_round_trip(via_type_pk_setters)
+
+    def test_termination_backward_compat_queryset_lookups(self):
+        """`Cable.objects` translates legacy `termination_[ab]_type`/`_id` lookups to `terminations__...`."""
+        interface_ct = ContentType.objects.get_for_model(Interface)
+        power_port_ct = ContentType.objects.get_for_model(PowerPort)
+
+        # type + id form (the shape serializers/Jobs use), on each side.
+        with self.assertWarns(DeprecationWarning):
+            self.assertEqual(
+                Cable.objects.get(termination_a_type=interface_ct, termination_a_id=self.interface1.pk),
+                self.cable,
+            )
+        with self.assertWarns(DeprecationWarning):
+            self.assertEqual(
+                Cable.objects.get(termination_b_type=interface_ct, termination_b_id=self.interface2.pk),
+                self.cable,
+            )
+
+        # Both ends together (separate joins so A and B don't collide on one row).
+        with self.assertWarns(DeprecationWarning):
+            self.assertEqual(
+                list(
+                    Cable.objects.filter(
+                        termination_a_type=interface_ct,
+                        termination_a_id=self.interface1.pk,
+                        termination_b_type=interface_ct,
+                        termination_b_id=self.interface2.pk,
+                    )
+                ),
+                [self.cable],
+            )
+
+        # `*_type_id` (integer ContentType PK) is accepted as an alternative to `*_type`.
+        with self.assertWarns(DeprecationWarning):
+            self.assertEqual(
+                Cable.objects.get(termination_a_type_id=interface_ct.pk, termination_a_id=self.interface1.pk),
+                self.cable,
+            )
+        # `*_type_id` alone (no id) matches any cable whose named side terminates on that type.
+        with self.assertWarns(DeprecationWarning):
+            self.assertEqual(Cable.objects.get(termination_b_type_id=interface_ct.pk), self.cable)
+        # A `*_type` and `*_type_id` that agree are accepted; conflicting values raise.
+        with self.assertWarns(DeprecationWarning):
+            self.assertEqual(
+                Cable.objects.get(
+                    termination_a_type=interface_ct,
+                    termination_a_type_id=interface_ct.pk,
+                    termination_a_id=self.interface1.pk,
+                ),
+                self.cable,
+            )
+        with self.assertRaises(TypeError):
+            Cable.objects.filter(termination_a_type=interface_ct, termination_a_type_id=power_port_ct.pk).first()
+        # A non-matching `*_type_id` finds nothing.
+        with self.assertWarns(DeprecationWarning):
+            self.assertFalse(Cable.objects.filter(termination_a_type_id=power_port_ct.pk).exists())
+
+        # Bare id (no type) is matched across every per-type FK.
+        with self.assertWarns(DeprecationWarning):
+            self.assertEqual(Cable.objects.get(termination_a_id=self.interface1.pk), self.cable)
+
+        # Type alone (no id) matches any cable whose named side terminates on that type.
+        with self.assertWarns(DeprecationWarning):
+            self.assertEqual(Cable.objects.get(termination_a_type=interface_ct), self.cable)
+        with self.assertWarns(DeprecationWarning):
+            self.assertFalse(Cable.objects.filter(termination_a_type=power_port_ct).exists())
+
+        # Non-matching lookups return nothing.
+        with self.assertWarns(DeprecationWarning):
+            self.assertFalse(
+                Cable.objects.filter(termination_a_type=power_port_ct, termination_a_id=self.power_port1.pk).exists()
+            )
+
+        # exclude() drops the matching cable.
+        with self.assertWarns(DeprecationWarning):
+            self.assertNotIn(
+                self.cable,
+                Cable.objects.exclude(termination_a_type=interface_ct, termination_a_id=self.interface1.pk),
+            )
+
+        # get_or_create: legacy lookup finds the existing cable (no create), and the create branch
+        # materializes join rows for a new one.
+        with self.assertWarns(DeprecationWarning):
+            found, created = Cable.objects.get_or_create(
+                termination_a_type=interface_ct,
+                termination_a_id=self.interface1.pk,
+                termination_b_type=interface_ct,
+                termination_b_id=self.interface2.pk,
+                defaults={"status": self.status},
+            )
+        self.assertFalse(created)
+        self.assertEqual(found, self.cable)
+
+        rear_port_ct = ContentType.objects.get_for_model(RearPort)
+        with self.assertWarns(DeprecationWarning):
+            made, created = Cable.objects.get_or_create(
+                termination_a_type=interface_ct,
+                termination_a_id=self.interface3.pk,
+                termination_b_type=rear_port_ct,
+                termination_b_id=self.rear_port1.pk,
+                defaults={"status": self.status},
+            )
+        self.assertTrue(created)
+        self.assertEqual(made.termination_a, self.interface3)
+        self.assertEqual(made.termination_b, self.rear_port1)
+
+    def test_termination_backward_compat_queryset_none_matches_nothing(self):
+        """A referenced side with any explicit `None` legacy kwarg matches nothing (old non-nullable columns).
+
+        The kwarg must be popped rather than passed through -- `termination_a_type` / `termination_a_id`
+        are no longer real fields, so leaking one to the underlying queryset would raise `FieldError`, and
+        dropping it silently would widen `filter()` to every Cable. Instead we mirror the old
+        `... IS NULL`-on-a-non-nullable-column behavior: empty result, and `DoesNotExist` from `.get()`.
+        A `None` on one key empties the side even alongside a real value on the other key
+        (`type IS NULL AND id = <pk>` matched nothing).
+        """
+        interface_ct = ContentType.objects.get_for_model(Interface)
+        self.assertTrue(Cable.objects.exists())  # there is something to (fail to) match
+        empty_lookups = (
+            {"termination_a_type": None},
+            {"termination_a_type_id": None},
+            {"termination_a_id": None},
+            {"termination_b_id": None},
+            {"termination_a_type": None, "termination_a_id": self.interface1.pk},  # None alongside a real id
+            {"termination_a_type": interface_ct, "termination_a_id": None},  # None alongside a real type
+            {"termination_a_type_id": None, "termination_a_id": self.interface1.pk},  # None type_id alongside real id
+        )
+        for kwargs in empty_lookups:
+            with self.subTest(kwargs=kwargs):
+                self.assertFalse(Cable.objects.filter(**kwargs).exists())
+                with self.assertRaises(Cable.DoesNotExist):
+                    Cable.objects.get(**kwargs)
+        # `exclude()` inverts to the full set, matching `exclude(<col> IS NULL)` over non-nullable columns.
+        self.assertQuerySetEqual(Cable.objects.exclude(termination_a_type=None), Cable.objects.all())
 
     def test_cable_deletion(self):
         """
@@ -3851,13 +3984,15 @@ class CableTestCase(ModelTestCases.BaseModelTestCase):
             incompatible_row.full_clean()
 
     def test_cabletocabletermination_rejects_incompatible_peer_on_breakout_lane(self):
-        """On a 1x2 breakout, each B-side row peers with A-connector 1 — incompatible types fail clean."""
+        """On a 1x2 breakout, each B-side row peers with A-connector 1 — incompatible pairs fail clean."""
         ct = CableType.objects.create(name="Test 1x2 mixed", a_connectors=1, b_connectors=2, total_lanes=2)
         cable = Cable.objects.create(status=self.status, cable_type=ct)
-        CableToCableTermination.objects.create(cable=cable, cable_end="A", interface=self.interface3, connector=1)
-        # B-side connector 2 shares lane 2 with A-connector 1, so this pair gets checked.
-        incompatible_row = CableToCableTermination(cable=cable, cable_end="B", power_port=self.power_port1, connector=2)
-        with self.assertRaisesRegex(ValidationError, "Incompatible termination types"):
+        # Both rear ports are breakout-eligible, but their position counts differ (3 vs 2), so the
+        # peer-pair check across lane 2 must fail. (A non-eligible type would instead be rejected
+        # outright by the multi-connector eligibility check before the pair check runs.)
+        CableToCableTermination.objects.create(cable=cable, cable_end="A", rear_port=self.rear_port3, connector=1)
+        incompatible_row = CableToCableTermination(cable=cable, cable_end="B", rear_port=self.rear_port2, connector=2)
+        with self.assertRaisesRegex(ValidationError, "same number of positions"):
             incompatible_row.full_clean()
 
     def test_cabletocabletermination_compatible_peer_on_breakout_lane_accepted(self):
@@ -3968,6 +4103,20 @@ class CableTestCase(ModelTestCases.BaseModelTestCase):
             qs = Interface.objects.select_related("cable__status")
             list(qs[:1])
         self.assertTrue(any(issubclass(w.category, DeprecationWarning) for w in caught))
+
+    def test_select_related_none_clears_without_warning(self):
+        """`select_related(None)` passes through untouched and does not warn.
+
+        Regression test: the translation previously called `field.startswith(...)` on every field,
+        which raised `AttributeError` for the `None` sentinel that Django passes to clear
+        select_related.
+        """
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            qs = Interface.objects.select_related("device").select_related(None)
+            list(qs[:1])  # force evaluation
+        self.assertEqual(qs.query.select_related, False)
+        self.assertFalse(any(issubclass(w.category, DeprecationWarning) for w in caught))
 
     def test_filter_cable_none_translates_to_isnull_true(self):
         """`filter(cable=None)` is treated as "uncabled" — translates to `cable_termination__isnull=True`."""
@@ -4152,6 +4301,32 @@ class CableTestCase(ModelTestCases.BaseModelTestCase):
         with self.assertRaises(ValidationError):
             standard_cable.add_termination(self.interface3, "A", connector=0)
 
+    def test_multi_connector_cable_type_requires_breakout_eligible_termination(self):
+        """A multi-connector cable type only accepts breakout-eligible termination types."""
+        breakout_type = CableType.objects.create(name="Eligibility 1x4", a_connectors=1, b_connectors=4, total_lanes=4)
+        cable = Cable.objects.create(status=self.status, cable_type=breakout_type)
+        # A PowerPort is not breakout-eligible, so it cannot terminate a multi-connector cable.
+        with self.assertRaisesRegex(ValidationError, "cannot terminate a multi-connector cable type"):
+            cable.add_termination(self.power_port1, cable_end="A", connector=1)
+        self.assertFalse(CableToCableTermination.objects.filter(cable=cable).exists())
+
+    def test_symmetric_multi_connector_cable_type_requires_breakout_eligible_termination(self):
+        """A symmetric multi-connector type (is_breakout False) still requires eligible terminations."""
+        shuffle_type = CableType.objects.create(name="Eligibility 2x2", a_connectors=2, b_connectors=2, total_lanes=8)
+        self.assertFalse(shuffle_type.is_breakout)
+        self.assertTrue(shuffle_type.is_multi_connector)
+        cable = Cable.objects.create(status=self.status, cable_type=shuffle_type)
+        with self.assertRaisesRegex(ValidationError, "cannot terminate a multi-connector cable type"):
+            cable.add_termination(self.power_port1, cable_end="A", connector=1)
+
+    def test_single_connector_cable_type_allows_any_termination(self):
+        """A single-connector cable type imposes no breakout-eligibility restriction."""
+        simple_type = CableType.objects.create(name="Eligibility 1x1", a_connectors=1, b_connectors=1, total_lanes=1)
+        cable = Cable.objects.create(status=self.status, cable_type=simple_type)
+        # A PowerPort on a single-connector cable type must not raise the breakout-eligibility error.
+        cable.add_termination(self.power_port1, cable_end="A", connector=1)
+        self.assertEqual(cable.terminations.count(), 1)
+
 
 class CableToCableTerminationTestCase(ModelTestCases.BaseModelTestCase):
     model = CableToCableTermination
@@ -4164,10 +4339,6 @@ class CableToCableTerminationTestCase(ModelTestCases.BaseModelTestCase):
             termination_b=Interface.objects.exclude(type__in=NONCONNECTABLE_IFACE_TYPES).last(),
             status=cls.status,
         )
-
-    def test_get_docs_url(self):
-        """Docs page for this model doesn't exist yet."""
-        # TODO: remove this override once a docs page is added for CableToCableTermination.
 
     def test_properties_handle_invalid_data(self):
         """The database permits a null `termination` (no FK set), make sure it doesn't error out various cases."""
@@ -5309,6 +5480,10 @@ class ModuleBayTestCase(ModularDeviceComponentTestCaseMixin, ModelTestCases.Base
         module.location = Location.objects.get_for_model(Module).first()
         module.save()
 
+        parent_module_bay.refresh_from_db()
+        child_module_bay.refresh_from_db()
+        grandchild_module_bay.refresh_from_db()
+
         self.assertEqual(parent_module_bay.parent, self.device)
         self.assertIsNone(child_module_bay.parent)
         self.assertIsNone(grandchild_module_bay.parent)
@@ -5432,10 +5607,7 @@ class ModuleTestCase(ModelTestCases.BaseModelTestCase):
             rear_port_position=2,
         )
 
-        ModuleBayTemplate.objects.create(
-            module_type=cls.module_type,
-            position="1111",
-        )
+        ModuleBayTemplate.objects.create(module_type=cls.module_type, position="1111", name="slot 1")
 
         cls.module = Module.objects.create(
             module_type=cls.module_type,
@@ -5494,11 +5666,13 @@ class ModuleTestCase(ModelTestCases.BaseModelTestCase):
             parent_device=self.device,
             position="1111",
         )
+
         parent_module = Module.objects.create(
             module_type=self.module_type,
             parent_module_bay=parent_module_bay,
             status=self.status,
         )
+
         child_module_bay = parent_module.module_bays.first()
         child_module = Module.objects.create(
             module_type=self.module_type,
@@ -5520,6 +5694,10 @@ class ModuleTestCase(ModelTestCases.BaseModelTestCase):
         parent_module.parent_module_bay = None
         parent_module.location = self.location
         parent_module.save()
+
+        parent_module.refresh_from_db()
+        child_module.refresh_from_db()
+        grandchild_module.refresh_from_db()
 
         self.assertIsNone(parent_module.device)
         self.assertIsNone(child_module.device)

@@ -491,6 +491,13 @@ $grid-breakpoints: (
 $utilities: map-merge(
   $utilities,
   (
+    "nb-background-color": (
+      class: nb-bg,
+      property: background-color,
+      values: (
+        inherit: inherit,
+      ),
+    ),
     "nb-color": (
       class: nb-text,
       property: color,
@@ -1636,6 +1643,17 @@ html, body {
 body {
   /* Transition below is Bootstrap `$transition-collapse-width` with `width` replaced by `padding-inline`. */
   @include transition(padding-inline .35s ease);
+
+  /*
+   * While a Bootstrap modal opens/closes it writes an inline `padding-right` on `<body>` to compensate for the
+   * scrollbar it hides. Because `padding-inline` is transitioned above (for the sidenav/drawer slide), that
+   * modal-driven change would otherwise animate and make the whole page slide sideways ("wiggle"). The
+   * `nb-modal-transitioning` class is toggled around the modal lifecycle (see `modal.js`) to suppress the
+   * transition only for that brief window, keeping both the sidenav and drawer animations intact. See NAPPS-1136.
+   */
+  &.nb-modal-transitioning {
+    transition: none;
+  }
   display: grid;
   grid-template-areas:
     "sidenav banner-global-area drawer"
@@ -2183,7 +2201,9 @@ $nb-drawer-open-box-shadow: 0 0 0.625rem 0 rgba(0, 0, 0, 0.25);
   padding-inline-end: 1.9375rem; /* 31px */
   width: 4.5rem; /* 72px */
 }
-
+#nb-paginator-go-to{
+  width: 5.5rem;
+}
 /* Draggable */
 .nb-draggable-container {
   /*
@@ -2770,6 +2790,16 @@ pre.version, pre.version-stamp {
       display: block;
     }
   }
+}
+
+@include color-mode(dark, true) {
+  .nb-card-body-exposed {
+    background: var(--#{$prefix}tertiary-bg);
+  }
+}
+
+.nb-card-body-exposed {
+  background: var(--#{$prefix}body-bg);
 }
 
 /* Workaround to fix `d-none` being overridden by `d-md-flex` (and possibly other `d-{display}` classes). */

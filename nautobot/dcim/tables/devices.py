@@ -46,6 +46,7 @@ from .template_code import (
     CABLETERMINATION,
     DEVICE_LINK,
     DEVICEBAY_BUTTONS,
+    DeviceComponentNameColumn,
     INTERFACE_BUTTONS,
     INTERFACE_IPADDRESSES,
     INTERFACE_REDUNDANCY_GROUP_INTERFACES,
@@ -180,7 +181,7 @@ class DeviceTable(StatusTableMixin, RoleTableMixin, BaseTable):
     tenant = TenantColumn()
     location = tables.Column(linkify=True)
     rack = tables.Column(linkify=True)
-    device_type = tables.LinkColumn(
+    device_type = tables.LinkColumn(  # used because tables.Column() doesn't support `text` lambda
         viewname="dcim:devicetype",
         args=[Accessor("device_type__pk")],
         verbose_name="Type",
@@ -194,7 +195,7 @@ class DeviceTable(StatusTableMixin, RoleTableMixin, BaseTable):
         url_params={"devices": "pk"},
         verbose_name="Clusters",
     )
-    virtual_chassis = tables.LinkColumn(viewname="dcim:virtualchassis", args=[Accessor("virtual_chassis__pk")])
+    virtual_chassis = tables.Column(linkify=True)
     vc_position = tables.Column(verbose_name="VC Position")
     vc_priority = tables.Column(verbose_name="VC Priority")
     device_redundancy_group = tables.Column(linkify=True)
@@ -416,6 +417,13 @@ class CableTerminationTable(BaseTable):
         verbose_name="Cable Peer",
     )
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # The `cable_peer` column's prefetch is expensive (it walks the cable's terminations), so
+        # only apply it when that column is actually visible for this table/user.
+        for prefetch in self.Meta.model.cable_peer_prefetch_related_fields():  # pylint: disable=no-member
+            self.add_conditional_prefetch("cable_peer", prefetch=prefetch)
+
 
 class PathEndpointTable(CableTerminationTable):
     # The far-end of each CablePath originating from this endpoint (one per breakout lane).
@@ -428,6 +436,12 @@ class PathEndpointTable(CableTerminationTable):
         orderable=False,
     )
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Likewise, only prefetch the `connection` column's path destinations when it's visible.
+        for prefetch in self.Meta.model.connection_prefetch_related_fields():  # pylint: disable=no-member
+            self.add_conditional_prefetch("connection", prefetch=prefetch)
+
 
 class ConsolePortTable(ModularDeviceComponentTable, PathEndpointTable):
     tags = TagColumn(url_name="dcim:consoleport_list")
@@ -435,6 +449,7 @@ class ConsolePortTable(ModularDeviceComponentTable, PathEndpointTable):
 
     class Meta(ModularDeviceComponentTable.Meta):
         model = ConsolePort
+        row_attrs = {"class": cable_status_color_css}
         fields = (
             "pk",
             "device",
@@ -453,10 +468,7 @@ class ConsolePortTable(ModularDeviceComponentTable, PathEndpointTable):
 
 
 class DeviceModuleConsolePortTable(ConsolePortTable):
-    name = tables.TemplateColumn(
-        template_code='<i class="mdi mdi-console"></i> <a href="{{ record.get_absolute_url }}">{{ value }}</a>',
-        attrs={"td": {"class": "text-nowrap"}},
-    )
+    name = DeviceComponentNameColumn(modelname="consoleport")
 
     class Meta(ModularDeviceComponentTable.Meta):
         model = ConsolePort
@@ -495,6 +507,7 @@ class ConsoleServerPortTable(ModularDeviceComponentTable, PathEndpointTable):
 
     class Meta(ModularDeviceComponentTable.Meta):
         model = ConsoleServerPort
+        row_attrs = {"class": cable_status_color_css}
         fields = (
             "pk",
             "device",
@@ -513,11 +526,7 @@ class ConsoleServerPortTable(ModularDeviceComponentTable, PathEndpointTable):
 
 
 class DeviceModuleConsoleServerPortTable(ConsoleServerPortTable):
-    name = tables.TemplateColumn(
-        template_code='<i class="mdi mdi-console-network-outline"></i> '
-        '<a href="{{ record.get_absolute_url }}">{{ value }}</a>',
-        attrs={"td": {"class": "text-nowrap"}},
-    )
+    name = DeviceComponentNameColumn(modelname="consoleserverport")
 
     class Meta(ModularDeviceComponentTable.Meta):
         model = ConsoleServerPort
@@ -556,6 +565,7 @@ class PowerPortTable(ModularDeviceComponentTable, PathEndpointTable):
 
     class Meta(ModularDeviceComponentTable.Meta):
         model = PowerPort
+        row_attrs = {"class": cable_status_color_css}
         fields = (
             "pk",
             "device",
@@ -588,11 +598,7 @@ class PowerPortTable(ModularDeviceComponentTable, PathEndpointTable):
 
 
 class DeviceModulePowerPortTable(PowerPortTable):
-    name = tables.TemplateColumn(
-        template_code='<i class="mdi mdi-power-plug-outline"></i> <a href="{{ record.get_absolute_url }}">'
-        "{{ value }}</a>",
-        attrs={"td": {"class": "text-nowrap"}},
-    )
+    name = DeviceComponentNameColumn(modelname="powerport")
 
     class Meta(ModularDeviceComponentTable.Meta):
         model = PowerPort
@@ -635,6 +641,7 @@ class PowerOutletTable(ModularDeviceComponentTable, PathEndpointTable):
 
     class Meta(ModularDeviceComponentTable.Meta):
         model = PowerOutlet
+        row_attrs = {"class": cable_status_color_css}
         fields = (
             "pk",
             "device",
@@ -666,10 +673,7 @@ class PowerOutletTable(ModularDeviceComponentTable, PathEndpointTable):
 
 
 class DeviceModulePowerOutletTable(PowerOutletTable):
-    name = tables.TemplateColumn(
-        template_code='<i class="mdi mdi-power-socket"></i> <a href="{{ record.get_absolute_url }}">{{ value }}</a>',
-        attrs={"td": {"class": "text-nowrap"}},
-    )
+    name = DeviceComponentNameColumn(modelname="poweroutlet")
 
     class Meta(ModularDeviceComponentTable.Meta):
         model = PowerOutlet
@@ -728,12 +732,13 @@ class InterfaceTable(ModularDeviceComponentTable, BaseInterfaceTable, PathEndpoi
         url_params={"interfaces": "pk"},
         verbose_name="Virtual Device Contexts",
     )
-    speed = tables.Column(verbose_name="Speed", accessor="speed", orderable=True)
-    duplex = tables.Column(verbose_name="Duplex", accessor="duplex", orderable=True)
+    speed = tables.Column(verbose_name="Speed", accessor="speed")
+    duplex = tables.Column(verbose_name="Duplex", accessor="duplex")
     actions = ButtonsColumn(model=Interface, prepend_template=INTERFACE_BUTTONS)
 
     class Meta(ModularDeviceComponentTable.Meta):
         model = Interface
+        row_attrs = {"class": cable_status_color_css}
         fields = (
             "pk",
             "device",
@@ -747,6 +752,7 @@ class InterfaceTable(ModularDeviceComponentTable, BaseInterfaceTable, PathEndpoi
             "port_type",
             "speed",
             "duplex",
+            "breakout_position",
             "mgmt_only",
             "mtu",
             "vrf",
@@ -775,6 +781,8 @@ class InterfaceTable(ModularDeviceComponentTable, BaseInterfaceTable, PathEndpoi
             "type",
             "port_type",
             "speed",
+            "breakout_position",
+            "connection",
             "description",
             "actions",
         )
@@ -784,11 +792,18 @@ class InterfaceTable(ModularDeviceComponentTable, BaseInterfaceTable, PathEndpoi
 
 
 class DeviceModuleInterfaceTable(InterfaceTable):
-    name = tables.TemplateColumn(
-        template_code='<i class="mdi mdi-{% if iface.mgmt_only %}wrench{% elif iface.is_lag %}drag-horizontal-variant'
-        "{% elif iface.is_virtual %}circle{% elif iface.is_wireless %}wifi{% else %}ethernet"
-        '{% endif %}"></i> <a href="{{ record.get_absolute_url }}">{{ value }}</a>',
-        attrs={"td": {"class": "text-nowrap"}},
+    name = DeviceComponentNameColumn(
+        modelname="interface",
+        # Keep in sync with IPAddressInterfaceTable.name.template_code
+        template_code=(
+            '<span class="mdi mdi-'
+            "{% if record.mgmt_only %}wrench"
+            "{% elif record.is_lag %}drag-horizontal-variant"
+            "{% elif record.is_virtual %}circle"
+            "{% elif record.is_wireless %}wifi"
+            '{% else %}ethernet{% endif %}"></span> '
+            '<a href="{{ record.get_absolute_url }}">{{ value }}</a>'
+        ),
     )
     parent_interface = tables.Column(linkify=True, verbose_name="Parent")
     bridge = tables.Column(linkify=True)
@@ -810,6 +825,7 @@ class DeviceModuleInterfaceTable(InterfaceTable):
             "speed",
             "duplex",
             "parent_interface",
+            "breakout_position",
             "bridge",
             "lag",
             "mgmt_only",
@@ -840,6 +856,7 @@ class DeviceModuleInterfaceTable(InterfaceTable):
             "port_type",
             "speed",
             "parent_interface",
+            "breakout_position",
             "lag",
             "mtu",
             "vrf",
@@ -868,6 +885,7 @@ class FrontPortTable(ModularDeviceComponentTable, CableTerminationTable):
 
     class Meta(ModularDeviceComponentTable.Meta):
         model = FrontPort
+        row_attrs = {"class": cable_status_color_css}
         fields = (
             "pk",
             "device",
@@ -898,10 +916,12 @@ class FrontPortTable(ModularDeviceComponentTable, CableTerminationTable):
 
 
 class DeviceModuleFrontPortTable(FrontPortTable):
-    name = tables.TemplateColumn(
-        template_code='<i class="mdi mdi-square-rounded{% if not record.cable %}-outline{% endif %}"></i> '
-        '<a href="{{ record.get_absolute_url }}">{{ value }}</a>',
-        attrs={"td": {"class": "text-nowrap"}},
+    name = DeviceComponentNameColumn(
+        modelname="frontport",
+        template_code=(
+            '<span class="mdi mdi-arrow-right-bold-box{% if not record.cable %}-outline{% endif %}"></span> '
+            '<a href="{{ record.get_absolute_url }}">{{ value }}</a>'
+        ),
     )
 
     class Meta(ModularDeviceComponentTable.Meta):
@@ -942,6 +962,7 @@ class RearPortTable(ModularDeviceComponentTable, CableTerminationTable):
 
     class Meta(ModularDeviceComponentTable.Meta):
         model = RearPort
+        row_attrs = {"class": cable_status_color_css}
         fields = (
             "pk",
             "device",
@@ -960,10 +981,12 @@ class RearPortTable(ModularDeviceComponentTable, CableTerminationTable):
 
 
 class DeviceModuleRearPortTable(RearPortTable):
-    name = tables.TemplateColumn(
-        template_code='<i class="mdi mdi-square-rounded{% if not record.cable %}-outline{% endif %}"></i> '
-        '<a href="{{ record.get_absolute_url }}">{{ value }}</a>',
-        attrs={"td": {"class": "text-nowrap"}},
+    name = DeviceComponentNameColumn(
+        modelname="rearport",
+        template_code=(
+            '<span class="mdi mdi-arrow-left-bold-box{% if not record.cable %}-outline{% endif %}"></span> '
+            '<a href="{{ record.get_absolute_url }}">{{ value }}</a>'
+        ),
     )
 
     class Meta(ModularDeviceComponentTable.Meta):
@@ -1080,10 +1103,12 @@ class ModuleBayTable(BaseTable):
 
 
 class DeviceDeviceBayTable(DeviceBayTable):
-    name = tables.TemplateColumn(
-        template_code='<i class="mdi mdi-circle-{% if record.installed_device %}slice-8{% else %}outline{% endif %}'
-        '"></i> <a href="{{ record.get_absolute_url }}">{{ value }}</a>',
-        attrs={"td": {"class": "text-nowrap"}},
+    name = DeviceComponentNameColumn(
+        modelname="devicebay",
+        template_code=(
+            '<span class="mdi mdi-circle-{% if record.installed_device %}slice-8{% else %}outline{% endif %}">'
+            '</span> <a href="{{ record.get_absolute_url }}">{{ value }}</a>'
+        ),
     )
 
     class Meta(DeviceComponentTable.Meta):
@@ -1107,13 +1132,18 @@ class DeviceDeviceBayTable(DeviceBayTable):
             "description",
             "actions",
         )
+        row_attrs = {
+            "class": lambda record: "table-success" if record.installed_device else "",
+        }
 
 
 class DeviceModuleBayTable(ModuleBayTable):
-    name = tables.TemplateColumn(
-        template_code='<i class="mdi mdi-{% if record.installed_module %}expansion-card-variant{% else %}tray{% endif %}'
-        '"></i> <a href="{{ record.get_absolute_url }}">{{ value }}</a>',
-        attrs={"td": {"class": "text-nowrap"}},
+    name = DeviceComponentNameColumn(
+        modelname="modulebay",
+        template_code=(
+            '<span class="mdi mdi-{% if record.installed_module %}expansion-card-variant{% else %}tray{% endif %}'
+            '"></span> <a href="{{ record.get_absolute_url }}">{{ value }}</a>'
+        ),
     )
     module_family = tables.Column(linkify=True, verbose_name="Family")
     installed_module = tables.Column(linkify=True, verbose_name="Installed Module")
@@ -1145,6 +1175,9 @@ class DeviceModuleBayTable(ModuleBayTable):
             "installed_module__status",
             "actions",
         )
+        row_attrs = {
+            "class": lambda record: "table-success" if record.installed_module else "",
+        }
 
 
 class ModuleModuleBayTable(DeviceModuleBayTable):
@@ -1188,10 +1221,14 @@ class InventoryItemTable(DeviceComponentTable):
 
 
 class DeviceInventoryItemTable(InventoryItemTable):
-    name = tables.TemplateColumn(
-        template_code='<a href="{{ record.get_absolute_url }}" style="padding-left: {{ record.tree_depth }}0px">'
-        "{{ value }}</a>",
-        attrs={"td": {"class": "text-nowrap"}},
+    name = DeviceComponentNameColumn(
+        modelname="inventoryitem",
+        template_code=(
+            "{% load cables %}"
+            '<span class="mdi {{ record|termination_type_icon }}" style="padding-left: {{ record.tree_depth }}0px">'
+            "</span> "
+            '<a href="{{ record.get_absolute_url }}">{{ value }}</a>'
+        ),
     )
     actions = ButtonsColumn(model=InventoryItem)
 

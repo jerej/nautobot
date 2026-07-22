@@ -19,6 +19,7 @@ from nautobot.core.factory import (
     UniqueFaker,
 )
 from nautobot.core.templatetags.helpers import bettertitle
+from nautobot.core.utils.lookup import get_form_for_model
 from nautobot.extras.choices import (
     DynamicGroupTypeChoices,
     JobQueueTypeChoices,
@@ -37,6 +38,7 @@ from nautobot.extras.models import (
     Job,
     JobLogEntry,
     JobQueue,
+    JobQueueAssignment,
     JobResult,
     MetadataChoice,
     MetadataType,
@@ -47,6 +49,7 @@ from nautobot.extras.models import (
     StaticGroupAssociation,
     Status,
     Tag,
+    TaggedItem,
     Team,
 )
 from nautobot.extras.utils import (
@@ -163,11 +166,16 @@ class JobQueueFactory(PrimaryModelFactory):
     @factory.post_generation
     def jobs(self, create, extracted, **kwargs):
         jobs = get_random_instances(Job)
-        self.jobs.set(jobs)
         for job in jobs:
+            JobQueueAssignmentFactory.create(job=job, job_queue=self)
             if not job.job_queues_override:
                 job.job_queues_override = True
                 job.validated_save()
+
+
+class JobQueueAssignmentFactory(BaseModelFactory):
+    class Meta:
+        model = JobQueueAssignment
 
 
 class JobResultFactory(BaseModelFactory):
@@ -564,12 +572,20 @@ class DynamicGroupFactory(PrimaryModelFactory):
 
     @factory.lazy_attribute
     def content_type(self):
-        while True:
-            content_type = factory.random.randgen.choice(
-                ContentType.objects.filter(FeatureQuery("dynamic_groups").get_query())
-            )
-            if content_type.model_class().objects.exists():
-                return content_type
+        eligible = list(ContentType.objects.filter(FeatureQuery("dynamic_groups").get_query()))
+        factory.random.randgen.shuffle(eligible)
+        for content_type in eligible:
+            model = content_type.model_class()
+            if model is None or not model.objects.exists():
+                continue
+            # dynamic-filter group is editable only when has FilterForm
+            if (
+                self.group_type == DynamicGroupTypeChoices.TYPE_DYNAMIC_FILTER
+                and get_form_for_model(model, form_prefix="Filter") is None
+            ):
+                continue
+            return content_type
+        raise RuntimeError("No eligible content_type found for DynamicGroupFactory")
 
 
 class SavedViewFactory(BaseModelFactory):
@@ -682,3 +698,8 @@ class TagFactory(OrganizationalModelFactory):
                 self.content_types.set(extracted)
             else:
                 self.content_types.set(get_random_instances(lambda: TaggableClassesQuery().as_queryset(), minimum=2))
+
+
+class TaggedItemFactory(BaseModelFactory):
+    class Meta:
+        model = TaggedItem

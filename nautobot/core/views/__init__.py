@@ -54,12 +54,18 @@ from rest_framework.versioning import AcceptHeaderVersioning
 from rest_framework.views import APIView
 
 from nautobot.core.celery import app
-from nautobot.core.constants import HOMEPAGE_PANELS_LAYOUT_COLUMNS, LIVE_SEARCH_MAX_RESULTS, SEARCH_MAX_RESULTS
+from nautobot.core.choices import NautobotEditionChoices
+from nautobot.core.constants import (
+    HOMEPAGE_PANELS_LAYOUT_COLUMNS,
+    LIVE_SEARCH_MAX_RESULTS,
+    NAUTOBOT_EDITION_URLS,
+    SEARCH_MAX_RESULTS,
+)
 from nautobot.core.releases import get_latest_release
 from nautobot.core.templatetags.helpers import has_one_or_more_perms, slugify
 from nautobot.core.ui.breadcrumbs import Breadcrumbs, ViewNameBreadcrumbItem
 from nautobot.core.ui.titles import Titles
-from nautobot.core.utils.config import get_settings_or_config
+from nautobot.core.utils.config import get_nautobot_edition, get_settings_or_config
 from nautobot.core.utils.lookup import (
     get_filterset_for_model,
     get_model_for_view_name,
@@ -563,36 +569,35 @@ class LiveSearchView(AccessMixin, View):
 
             if filterset and table_class:
                 filtered_queryset = filterset(request.GET).qs
-                if filtered_queryset:
-                    restricted_queryset = (
-                        filtered_queryset.restrict(request.user, "view")
-                        if hasattr(filtered_queryset, "restrict")
-                        else filtered_queryset
-                    )
-                    table = table_class(
-                        restricted_queryset,
-                        # Omit `table-hover` class, and defer item focus and selection to `search.js` script.
-                        attrs={"class": "table nb-table-headings"},
-                        hide_hierarchy_ui=True,
-                        configurable=False,
-                        orderable=False,
-                        row_attrs={
-                            # Event handlers and attributes below are defined in order to imitate anchor link behavior.
-                            "role": "link",
-                            "tabindex": 0,
-                            "onclick": lambda record: f'window.location.href = "{record.get_absolute_url()}";',
-                            "onkeydown": "if (event.key === 'Enter' || event.key === ' ') { event.currentTarget.click(); }",
-                        },
-                    )
-                    # Hide unnecessary "pk" and "actions" columns, if they would otherwise be displayed.
-                    for column in ["pk", "actions"]:
-                        if column in table.columns:
-                            table.columns.hide(column)
-                    table.paginate(per_page=LIVE_SEARCH_MAX_RESULTS)
+                restricted_queryset = (
+                    filtered_queryset.restrict(request.user, "view")
+                    if hasattr(filtered_queryset, "restrict")
+                    else filtered_queryset
+                )[: LIVE_SEARCH_MAX_RESULTS + 1]
+                table = table_class(
+                    restricted_queryset,
+                    # Omit `table-hover` class, and defer item focus and selection to `search.js` script.
+                    attrs={"class": "table nb-table-headings"},
+                    hide_hierarchy_ui=True,
+                    configurable=False,
+                    orderable=False,
+                    row_attrs={
+                        # Event handlers and attributes below are defined in order to imitate anchor link behavior.
+                        "role": "link",
+                        "tabindex": 0,
+                        "onclick": lambda record: f'window.location.href = "{record.get_absolute_url()}";',
+                        "onkeydown": "if (event.key === 'Enter' || event.key === ' ') { event.currentTarget.click(); }",
+                    },
+                )
+                # Hide unnecessary "pk" and "actions" columns, if they would otherwise be displayed.
+                for column in ["pk", "actions"]:
+                    if column in table.columns:
+                        table.columns.hide(column)
+                table.paginate(per_page=LIVE_SEARCH_MAX_RESULTS)
             return render(
                 request,
                 "components/htmx/live_search_results.html",
-                {"table": table},
+                {"href": f"/{path}?{request.GET.urlencode()}", "table": table},
             )
 
         return HttpResponseBadRequest("Endpoint in question supports only HTMX-made requests.")
@@ -801,10 +806,17 @@ class AboutView(AccessMixin, UIComponentsMixin, TemplateView):
         support_expiration_date = get_settings_or_config("NTC_SUPPORT_CONTRACT_EXPIRATION_DATE")
         support_contract_active = support_expiration_date and support_expiration_date >= datetime.date.today()
 
+        # Installed edition
+        nautobot_edition = get_nautobot_edition()
+        nautobot_edition_display = NautobotEditionChoices.as_dict().get(nautobot_edition, nautobot_edition)
+        edition_url = NAUTOBOT_EDITION_URLS.get(nautobot_edition, "https://nautobot.com")
+
         context = self.get_context_data()
         context.update(
             {
                 "new_release": new_release,
+                "nautobot_edition": nautobot_edition_display,
+                "edition_url": edition_url,
                 "support_contract_active": support_contract_active,
                 "support_expiration_date": support_expiration_date,
                 "view_titles": self.get_view_titles(),

@@ -39,7 +39,7 @@ def _device_term_config(term_model, term_label, display, has_filter, extra_query
         "parent_model": Device,
         "parent_label": "Device",
         "parent_field_name": "device",
-        "parent_query_params": {has_filter: True},
+        "parent_query_params": {has_filter: "true"},
         "term_model": term_model,
         "term_label": term_label,
         "term_query_params": query_params,
@@ -64,7 +64,7 @@ TERMINATION_TYPE_CONFIGS = {
         "parent_model": Circuit,
         "parent_label": "Circuit",
         "parent_field_name": "circuit",
-        "parent_query_params": {"has_terminations": True},
+        "parent_query_params": {"has_terminations": "true"},
         "term_model": CircuitTermination,
         "term_label": "Termination",
         "term_query_params": {"circuit": None},
@@ -74,7 +74,7 @@ TERMINATION_TYPE_CONFIGS = {
         "parent_model": PowerPanel,
         "parent_label": "Power Panel",
         "parent_field_name": "power_panel",
-        "parent_query_params": {"has_power_feeds": True},
+        "parent_query_params": {"has_power_feeds": "true"},
         "term_model": PowerFeed,
         "term_label": "Power Feed",
         "term_query_params": {"power_panel": None},
@@ -122,7 +122,7 @@ class CableTerminationFieldSet:
         # ({"type_field", "parent_field", "term_field"}) for template rendering.
     """
 
-    def get_fields(self, prefix, term_type=None, existing_term=None):
+    def get_fields(self, prefix, term_type=None, existing_term=None, cable_pk=None):
         """
         Produce form fields for selecting a cable termination.
 
@@ -130,6 +130,11 @@ class CableTerminationFieldSet:
             prefix: Field name prefix (e.g., "a_conn_1")
             term_type: Termination type string (e.g., "interface"). Auto-detected if not provided.
             existing_term: Existing termination object for pre-population.
+            cable_pk: PK of the cable being edited, if any. When set, the termination dropdown is
+                filtered to endpoints that are uncabled *or* already on this cable (via the
+                `available_for_cable` filter), so the cable's own endpoints stay pickable and can be
+                swapped between lanes/sides. When not set (creating a new cable), the dropdown is
+                filtered to uncabled endpoints only (`has_cable=false`).
 
         Returns:
             dict with keys:
@@ -176,7 +181,7 @@ class CableTerminationFieldSet:
             required=False,
             initial=parent if parent else None,
             query_params=config["parent_query_params"],
-            embedded_create=False,  # TODO: disabled for now for consistency with fields[term_field_name] below
+            embedded_create=False,
             embedded_search=True,
         )
         if parent:
@@ -193,15 +198,22 @@ class CableTerminationFieldSet:
             else:
                 query_params[key] = value
 
+        # Server-side availability filtering (replaces the old client-side `disabled_indicator`):
+        # editing an existing cable → uncabled endpoints plus this cable's own endpoints (so they
+        # can be swapped); creating a new cable → uncabled endpoints only.
+        if cable_pk is not None:
+            query_params["available_for_cable"] = str(cable_pk)
+        else:
+            query_params["has_cable"] = "false"
+
         fields[term_field_name] = DynamicModelChoiceField(
             queryset=config["term_model"].objects.all(),
             label=config["term_label"],
             required=False,
-            disabled_indicator="cable",
             initial=existing_term if existing_term else None,
             query_params=query_params,
-            embedded_create=False,  # TODO: disabled for now as ComponentCreateView doesn't work properly as embedded
-            embedded_search=True,
+            embedded_create=False,
+            embedded_search=False,  # disabled due to query_params not all propagating into modal - NAUTOBOT-1415
         )
         if existing_term:
             initial[term_field_name] = existing_term.pk

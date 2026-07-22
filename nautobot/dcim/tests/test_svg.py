@@ -4,8 +4,10 @@ import functools
 import re
 
 from django.test import SimpleTestCase, tag
+from django.utils.safestring import SafeString
 
 from nautobot.core.testing import TestCase
+from nautobot.dcim.choices import InterfaceTypeChoices
 from nautobot.dcim.models import (
     Cable,
     CableType,
@@ -21,7 +23,7 @@ from nautobot.dcim.models import (
     RearPort,
 )
 from nautobot.dcim.svg import constants as svg_constants
-from nautobot.dcim.svg.cable_breakout import BreakoutDiagramSVG
+from nautobot.dcim.svg.cable_breakout import BreakoutDiagramSVG, TerminationLabel
 from nautobot.dcim.svg.path_trace import CableTraceSVG
 from nautobot.dcim.svg.utils import estimate_text_width, fit_text
 from nautobot.dcim.utils import generate_cable_breakout_mapping
@@ -232,8 +234,6 @@ class BreakoutDiagramSVGTest(SimpleTestCase):
 
     def test_render_returns_safestring_with_matching_dimensions(self):
         """render() returns a SafeString whose svg dimensions match _total_width/_total_height."""
-        from django.utils.safestring import SafeString
-
         mapping = generate_cable_breakout_mapping(a_connectors=1, b_connectors=2, total_lanes=4)
         diagram = BreakoutDiagramSVG(mapping, show_status=False)
         svg = diagram.render()
@@ -278,6 +278,88 @@ class BreakoutDiagramSVGTest(SimpleTestCase):
             entry["label"] = f"VERY_LONG_LANE_LABEL_{i}"
         long_diagram = BreakoutDiagramSVG(mapping, show_status=False)
         self.assertGreater(long_diagram.line_area_width, BreakoutDiagramSVG.MINIMUM_LINE_AREA_WIDTH)
+
+    def test_termination_label_renders_clickable_parent_and_termination_links(self):
+        """A connected connector's label renders the parent and termination as separate hyperlinks."""
+        mapping = generate_cable_breakout_mapping(a_connectors=1, b_connectors=2, total_lanes=2)
+        svg = BreakoutDiagramSVG(
+            mapping,
+            show_status=True,
+            a_termination_labels={
+                1: TerminationLabel(
+                    term_text="Eth1/1",
+                    term_url="/dcim/interfaces/iface-uuid/",
+                    parent_text="switch-01",
+                    parent_url="/dcim/devices/device-uuid/",
+                )
+            },
+        ).render()
+        # Both objects are linked...
+        self.assertIn('xlink:href="/dcim/devices/device-uuid/"', svg)
+        self.assertIn('xlink:href="/dcim/interfaces/iface-uuid/"', svg)
+        # ...with their respective text, separated by a non-link " / ".
+        self.assertIn(">switch-01</tspan>", svg)
+        self.assertIn(">Eth1/1</tspan>", svg)
+        self.assertIn("> / </tspan>", svg)
+
+    def test_termination_label_without_parent_renders_only_termination(self):
+        """A label with no parent renders just the termination, with no separator."""
+        mapping = generate_cable_breakout_mapping(a_connectors=1, b_connectors=2, total_lanes=2)
+        svg = BreakoutDiagramSVG(
+            mapping,
+            show_status=True,
+            a_termination_labels={1: TerminationLabel(term_text="Eth1/1", term_url="/dcim/interfaces/iface-uuid/")},
+        ).render()
+        self.assertIn('xlink:href="/dcim/interfaces/iface-uuid/"', svg)
+        self.assertIn(">Eth1/1</tspan>", svg)
+        self.assertNotIn("> / </tspan>", svg)
+
+    def test_termination_label_without_url_renders_plain_text(self):
+        """A label segment with no URL is rendered as plain (non-link) text rather than a hyperlink."""
+        mapping = generate_cable_breakout_mapping(a_connectors=1, b_connectors=2, total_lanes=2)
+        svg = BreakoutDiagramSVG(
+            mapping,
+            show_status=True,
+            a_termination_labels={
+                1: TerminationLabel(term_text="NoUrlIface", term_url="", parent_text="dev2", parent_url="")
+            },
+        ).render()
+        self.assertNotIn("xlink:href", svg)
+        self.assertIn(">dev2</tspan>", svg)
+        self.assertIn(">NoUrlIface</tspan>", svg)
+
+    def test_termination_label_renders_full_text_without_truncation(self):
+        """Long labels are rendered in full (no ellipsis); width is handled by the scrollable card."""
+        mapping = generate_cable_breakout_mapping(a_connectors=1, b_connectors=2, total_lanes=2)
+        long_term = "GigabitEthernet" + "0" * 60
+        svg = BreakoutDiagramSVG(
+            mapping,
+            show_status=True,
+            a_termination_labels={1: TerminationLabel(term_text=long_term, parent_text="router-01")},
+        ).render()
+        self.assertIn(f">{long_term}</tspan>", svg)
+        self.assertIn(">router-01</tspan>", svg)
+        self.assertNotIn("…", svg)
+
+    def test_termination_label_area_width_grows_to_fit_labels(self):
+        """Reserving space for visible labels widens the diagram, and longer labels widen it further."""
+        mapping = generate_cable_breakout_mapping(a_connectors=1, b_connectors=2, total_lanes=2)
+        bare = BreakoutDiagramSVG(mapping, show_status=False)
+        labeled = BreakoutDiagramSVG(
+            mapping,
+            show_status=True,
+            a_termination_labels={1: TerminationLabel(term_text="Eth1/1", parent_text="switch-01")},
+        )
+        longer = BreakoutDiagramSVG(
+            mapping,
+            show_status=True,
+            a_termination_labels={1: TerminationLabel(term_text="Eth1/1", parent_text="switch-01" * 10)},
+        )
+        self.assertEqual(bare.a_label_area_width, 0)
+        self.assertGreater(labeled.a_label_area_width, 0)
+        self.assertGreater(labeled._total_width(), bare._total_width())
+        # Full labels are never truncated, so a longer label always reserves more width.
+        self.assertGreater(longer.a_label_area_width, labeled.a_label_area_width)
 
 
 class CableTraceSVGTestCase(TestCase):
@@ -443,6 +525,99 @@ class CableTraceSVGTestCase(TestCase):
         self.assertNotIn("Total segments", svg)
         self.assertNotIn("Total length", svg)
 
+    def test_breakout_fanout_renders_as_diagonal_fan_from_shared_trunk(self):
+        """The breakout fan-out draws one diagonal cable line per branch, all diverging from a single
+        trunk point, rather than a detached horizontal fork bar with separate vertical drops."""
+        breakout = CableType(name="SVG fan 1x2", a_connectors=1, b_connectors=2, total_lanes=2)
+        breakout.validated_save()  # populates `mapping` via clean()
+        trunk = Interface.objects.create(device=self.device, name="fan-trunk", status=self.interface_status)
+        lane1 = Interface.objects.create(device=self.device, name="fan-lane-1", status=self.interface_status)
+        lane2 = Interface.objects.create(device=self.device, name="fan-lane-2", status=self.interface_status)
+        cable = Cable(termination_a=trunk, termination_b=lane1, cable_type=breakout, status=self.connected)
+        cable.save()
+        cable.add_termination(lane2, "B", connector=2)
+
+        svg = CableTraceSVG(trunk).render()
+
+        # Parse each <line> regardless of attribute order; diagonals have both axes differing.
+        def coords(tag_):
+            attrs = {k: float(v) for k, v in re.findall(r'(x1|y1|x2|y2)="([\d.]+)"', tag_)}
+            return attrs if {"x1", "y1", "x2", "y2"} <= attrs.keys() else None
+
+        lines = [c for c in (coords(t) for t in re.findall(r"<line [^>]*>", svg)) if c]
+        diagonals = [line for line in lines if line["x1"] != line["x2"] and line["y1"] != line["y2"]]
+
+        # Two branches, each drawn as a border + a color stroke...
+        self.assertGreaterEqual(len(diagonals), 2)
+        # ...all sharing a single trunk origin...
+        origins = {(line["x1"], line["y1"]) for line in diagonals}
+        self.assertEqual(len(origins), 1, f"fan branches should share one trunk origin, got {origins}")
+        # ...and landing on (at least) two distinct columns.
+        self.assertGreaterEqual(len({line["x2"] for line in diagonals}), 2)
+
+        # Each landing connector is labeled at the foot of its branch (below the fan), since the
+        # label identifies the termination it lands on.
+        self.assertIn("B1", svg)
+        self.assertIn("B2", svg)
+
+        def label_y(text):
+            tag_ = re.search(rf"<text ([^>]*)>{text}</text>", svg).group(1)
+            return float(dict(re.findall(r'([\w-]+)="([^"]*)"', tag_))["y"])
+
+        branch_end_y = next(iter(diagonals))["y2"]
+        for label in ("B1", "B2"):
+            self.assertGreater(label_y(label), branch_end_y)
+
+    def test_breakout_fanout_labels_mapped_child_interface_on_branch_line(self):
+        """When a trunk's connectors map to child (sub)interfaces, each child is labeled on a pill
+        along its branch, while the landing connector label stays at the branch foot."""
+        breakout = CableType(name="SVG child 1x2", a_connectors=1, b_connectors=2, total_lanes=2)
+        breakout.validated_save()
+        trunk = Interface.objects.create(
+            device=self.device,
+            name="child-trunk",
+            type=InterfaceTypeChoices.TYPE_40GE_QSFP_PLUS,
+            status=self.interface_status,
+        )
+        children = [
+            Interface.objects.create(
+                device=self.device,
+                name=f"child-trunk.{pos}",
+                type=InterfaceTypeChoices.TYPE_VIRTUAL,
+                status=self.interface_status,
+                parent_interface=trunk,
+                breakout_position=pos,
+            )
+            for pos in (1, 2)
+        ]
+        lane1 = Interface.objects.create(device=self.device, name="child-lane-1", status=self.interface_status)
+        lane2 = Interface.objects.create(device=self.device, name="child-lane-2", status=self.interface_status)
+        cable = Cable(termination_a=trunk, termination_b=lane1, cable_type=breakout, status=self.connected)
+        cable.save()
+        cable.add_termination(lane2, "B", connector=2)
+
+        svg = CableTraceSVG(trunk).render()
+
+        diagonals = [
+            {k: float(v) for k, v in re.findall(r'(x1|y1|x2|y2)="([\d.]+)"', tag)}
+            for tag in re.findall(r"<line [^>]*>", svg)
+        ]
+        diagonals = [d for d in diagonals if {"x1", "y1", "x2", "y2"} <= d.keys() and d["x1"] != d["x2"]]
+        apex_y = min(d["y1"] for d in diagonals)
+        branch_end_y = max(d["y2"] for d in diagonals)
+
+        def label_y(text):
+            tag_ = re.search(rf"<text ([^>]*)>{re.escape(text)}</text>", svg).group(1)
+            return float(dict(re.findall(r'([\w-]+)="([^"]*)"', tag_))["y"])
+
+        # The child (sub)interface sits on a pill along the branch (between the fan apex and foot)...
+        for child in children:
+            self.assertIn(str(child), svg)
+            self.assertLess(apex_y, label_y(str(child)))
+            self.assertLess(label_y(str(child)), branch_end_y)
+        # ...while the bare connector label stays at the foot, below the branch.
+        self.assertGreater(label_y("B1"), branch_end_y)
+
     def test_one_to_one_cable_type_renders_as_linear_trace(self):
         """A cable_type that maps the origin's connector to a single far connector is not a fan-out.
 
@@ -541,6 +716,48 @@ class CableTraceSVGTestCase(TestCase):
         self.assertIn(str(uncabled_front), next_hops)
         self.assertIsNone(next_hops[str(uncabled_front)])
 
+    def test_disconnected_breakout_lane_renders_incomplete_not_split(self):
+        """Tracing from a breakout child (sub)interface whose lane has no far-side termination yields
+        a single-leg trace over a `CablePath` flagged `is_split` with `path=[cable]` and no onward
+        nodes (see `CablePath.get_split_nodes`). Rendering must not raise (regression: `Cable` has no
+        `get_cable_peers`), and the footer must report an incomplete trace rather than an empty
+        "Path split! Select a node below to continue" prompt that has nothing to select.
+
+        [IF_trunk] --C (breakout 1:2, lane 1)-- [IF_leaf]; trunk child on lane 2 is disconnected.
+        """
+        breakout = CableType(name="SVG disconnected 1x2", a_connectors=1, b_connectors=2, total_lanes=2)
+        breakout.validated_save()  # populates `mapping` via clean()
+        trunk = Interface.objects.create(
+            device=self.device,
+            name="disc-trunk",
+            type=InterfaceTypeChoices.TYPE_40GE_QSFP_PLUS,
+            status=self.interface_status,
+        )
+        leaf = Interface.objects.create(device=self.device, name="disc-leaf", status=self.interface_status)
+        # Only lane 1 is cabled (trunk A1 ↔ leaf B1); lane 2 has no far-side termination.
+        Cable(termination_a=trunk, termination_b=leaf, cable_type=breakout, status=self.connected).save()
+        # A child subinterface on the disconnected lane 2.
+        child = Interface.objects.create(
+            device=self.device,
+            name="disc-trunk.2",
+            type=InterfaceTypeChoices.TYPE_VIRTUAL,
+            status=self.interface_status,
+            parent_interface=trunk,
+            breakout_position=2,
+        )
+
+        cable_path = child.get_breakout_lane_cable_path()
+        self.assertTrue(cable_path.is_split)
+        self.assertEqual(list(cable_path.get_split_nodes()), [])
+
+        diagram = CableTraceSVG(child)
+        self.assertEqual(diagram.trunk_origin, trunk)
+        self.assertEqual(len(diagram.fanout_paths), 1)
+        svg = diagram.render()
+        self.assertIn("Trace incomplete", svg)
+        self.assertNotIn("Path split!", svg)
+        self.assertNotIn("Select a node below to continue", svg)
+
     def test_long_cable_label_fits_within_canvas_width(self):
         """The canvas must be wide enough that a long cable label is not clipped on the right."""
         iface_a = Interface.objects.create(device=self.device, name="wide-a", status=self.interface_status)
@@ -617,3 +834,99 @@ class CableTraceSVGTestCase(TestCase):
         # The shared rear port is drawn once (consecutive run), the distinct one once.
         self.assertEqual(svg.count("Rear-Shared"), 1, "Shared rear port should render once, not per leg")
         self.assertEqual(svg.count("Rear-Other"), 1)
+
+    def _make_breakout_trunk_terminus(self):
+        """A leaf interface breakout-cabled to a trunk that has a child (sub)interface on lane 1.
+
+        Returns `(leaf, trunk, child)`. Tracing from `leaf` ends on the breakout trunk `trunk`,
+        whose child interface `child` maps to the trunk-connector position `leaf`'s lane carries.
+        """
+        breakout = CableType(name="SVG terminus 1x2", a_connectors=1, b_connectors=2, total_lanes=2)
+        breakout.validated_save()
+        trunk = Interface.objects.create(
+            device=self.device,
+            name="terminus-trunk",
+            type=InterfaceTypeChoices.TYPE_40GE_QSFP_PLUS,
+            status=self.interface_status,
+        )
+        child = Interface.objects.create(
+            device=self.device,
+            name="terminus-trunk.1",
+            type=InterfaceTypeChoices.TYPE_VIRTUAL,
+            status=self.interface_status,
+            parent_interface=trunk,
+            breakout_position=1,
+        )
+        leaf = Interface.objects.create(
+            device=self.device,
+            name="terminus-leaf",
+            type=InterfaceTypeChoices.TYPE_10GE_SFP_PLUS,
+            status=self.interface_status,
+        )
+        # trunk (A1) --breakout--> leaf (B1); the leaf's lane maps back to child position 1.
+        Cable(termination_a=trunk, termination_b=leaf, cable_type=breakout, status=self.connected).save()
+        return leaf, trunk, child
+
+    def test_trace_ending_in_breakout_trunk_renders_subinterface_box(self):
+        """A trace ending on a breakout trunk folds the trunk's mapped child interface onto the
+        terminal device as a passthrough-style departing port (the trunk port on top, the child
+        (sub)interface box below it)."""
+        leaf, trunk, child = self._make_breakout_trunk_terminus()
+        self.assertEqual(leaf.get_breakout_trunk_child_interface_for_endpoint(trunk), child)
+
+        diagram = CableTraceSVG(leaf)
+        terminal_cells = [
+            cell
+            for cell in self._matrix_cells(diagram)
+            if cell["type"] == "passthrough_node" and cell.get("arriving") == trunk
+        ]
+        self.assertEqual(len(terminal_cells), 1, "Terminal trunk node should fold into a passthrough node")
+        self.assertEqual(terminal_cells[0]["departing"], child)
+
+        svg = diagram.render()
+        self.assertIn(str(child), svg)
+
+    def test_trace_from_subinterface_renders_single_lane_with_subinterface_on_top(self):
+        """Tracing from a breakout child (sub)interface follows only the parent trunk's matching lane
+        (a single linear leg, not the trunk's full fan-out) and draws the originating subinterface
+        atop its parent trunk port — the vertical mirror of a trace ending on that trunk."""
+        leaf, trunk, child = self._make_breakout_trunk_terminus()
+
+        diagram = CableTraceSVG(child)
+        # The child interface has no CablePath of its own; the renderer follows the parent trunk's lane.
+        self.assertEqual(diagram.trunk_origin, trunk)
+        self.assertEqual(len(diagram.fanout_paths), 1, "A subinterface trace follows one lane, not a fan-out")
+        self.assertEqual(diagram.fanout_paths[0]["termination"], leaf)
+
+        svg = diagram.render()
+        # The subinterface (origin), its parent trunk, and the far endpoint all appear.
+        self.assertIn(str(child), svg)
+        self.assertIn(str(trunk), svg)
+        self.assertIn(str(leaf), svg)
+        # The origin subinterface is highlighted (active termination box: success stroke, width 3).
+        self.assertIn(f'stroke="{svg_constants.COLOR_SUCCESS}"', svg)
+
+    def test_trace_from_subinterface_with_explicit_cable_path(self):
+        """Passing the parent trunk's lane `CablePath` explicitly (as the view does for a
+        `?cablepath_id=` selection) renders the same single-lane, subinterface-on-top trace."""
+        leaf, trunk, child = self._make_breakout_trunk_terminus()
+        lane = child.get_breakout_lane()
+        path = next(p for p in trunk.cable_paths.all() if p.peer_connector == lane.far_connector)
+
+        diagram = CableTraceSVG(child, cable_path=path)
+        self.assertEqual(diagram.trunk_origin, trunk)
+        self.assertEqual(len(diagram.fanout_paths), 1)
+        svg = diagram.render()
+        self.assertIn(str(child), svg)
+        self.assertIn(str(leaf), svg)
+
+    def test_trace_from_trunk_side_does_not_render_subinterface_box(self):
+        """Tracing the *other* direction — from the trunk out to its fan-out leaf — leaves the leaf
+        as a plain terminal `node`: the leaf isn't a breakout trunk, so no child-interface box is
+        folded onto it (the subinterface only renders when the trace *ends* on a trunk)."""
+        leaf, trunk, _child = self._make_breakout_trunk_terminus()
+
+        cells = self._matrix_cells(CableTraceSVG(trunk))
+        leaf_nodes = [cell for cell in cells if cell["type"] == "node" and cell.get("termination") == leaf]
+        self.assertEqual(len(leaf_nodes), 1, "Fan-out leaf should remain a plain terminal node")
+        self.assertFalse(any(cell["type"] == "passthrough_node" for cell in cells))

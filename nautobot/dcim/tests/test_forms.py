@@ -1,3 +1,4 @@
+import json
 import uuid
 
 from constance.test import override_config
@@ -20,11 +21,14 @@ from nautobot.dcim.choices import (
 from nautobot.dcim.constants import RACK_U_HEIGHT_DEFAULT
 from nautobot.dcim.forms import (
     CableForm,
+    ConsoleServerPortTemplateFilterForm,
+    ConsoleServerPortTemplateForm,
     DeviceFilterForm,
     DeviceForm,
     InterfaceBulkEditForm,
     InterfaceCreateForm,
     InterfaceForm,
+    ModuleForm,
     PopulateDeviceBayForm,
     RackForm,
 )
@@ -33,6 +37,7 @@ from nautobot.dcim.models import (
     CableToCableTermination,
     CableType,
     ConsolePort,
+    ConsoleServerPort,
     Device,
     DeviceBay,
     DeviceType,
@@ -40,6 +45,8 @@ from nautobot.dcim.models import (
     Location,
     LocationType,
     Manufacturer,
+    ModuleBay,
+    ModuleFamily,
     Platform,
     PowerFeed,
     PowerPanel,
@@ -52,6 +59,14 @@ from nautobot.extras.models import Role, SecretsGroup, Status
 from nautobot.ipam.models import VLAN
 from nautobot.tenancy.models import Tenant
 from nautobot.virtualization.models import Cluster, ClusterGroup, ClusterType
+
+
+class ConsoleServerPortTemplateTestCase(FormTestCases.BaseFormTestCase):
+    form_class = ConsoleServerPortTemplateForm
+
+    def test_empty_filter_is_valid(self):
+        form = ConsoleServerPortTemplateFilterForm(data={})
+        self.assertTrue(form.is_valid(), form.errors)
 
 
 class DeviceTestCase(FormTestCases.BaseFormTestCase):
@@ -790,6 +805,24 @@ class CableTerminationFieldSetTestCase(TestCase):
         self.assertIs(result["fields"]["b_conn_1_parent"].queryset.model, PowerPanel)
         self.assertIs(result["fields"]["b_conn_1_termination"].queryset.model, PowerFeed)
 
+    def test_get_fields_new_cable_filters_to_uncabled(self):
+        """Without a cable_pk (new cable), the termination dropdown is limited to uncabled endpoints."""
+        result = CableTerminationFieldSet().get_fields("a_conn_1")
+        attrs = result["fields"]["a_conn_1_termination"].widget.attrs
+        self.assertEqual(json.loads(attrs["data-query-param-has_cable"]), ["false"])
+        self.assertNotIn("data-query-param-available_for_cable", attrs)
+        # The old client-side disabled-indicator mechanism is fully replaced by server-side filtering.
+        self.assertNotIn("disabled-indicator", attrs)
+
+    def test_get_fields_existing_cable_filters_available_for_cable(self):
+        """With a cable_pk, the dropdown is limited to endpoints uncabled or already on that cable."""
+        cable_pk = "11111111-1111-1111-1111-111111111111"
+        result = CableTerminationFieldSet().get_fields("a_conn_1", cable_pk=cable_pk)
+        attrs = result["fields"]["a_conn_1_termination"].widget.attrs
+        self.assertEqual(json.loads(attrs["data-query-param-available_for_cable"]), [cable_pk])
+        self.assertNotIn("data-query-param-has_cable", attrs)
+        self.assertNotIn("disabled-indicator", attrs)
+
 
 class CableFormTestCase(FormTestCases.BaseFormTestCase):
     """Behavioral tests for `CableForm`. Scope expected to grow over time."""
@@ -1069,6 +1102,23 @@ class CableFormTestCase(FormTestCases.BaseFormTestCase):
         """A 1x4 breakout CableType for lane-layout assertions."""
         return CableType.objects.create(name="Form Test 1x4", a_connectors=1, b_connectors=4, total_lanes=4)
 
+    @classmethod
+    def _shuffle_cable_type(cls):
+        """A polarity-shuffled 2x2 CableType: each A connector wires to BOTH B connectors (a mesh)."""
+        mapping = [
+            {"label": "1", "a_connector": 1, "a_position": 1, "b_connector": 1, "b_position": 1},
+            {"label": "2", "a_connector": 1, "a_position": 2, "b_connector": 1, "b_position": 2},
+            {"label": "3", "a_connector": 1, "a_position": 3, "b_connector": 2, "b_position": 1},
+            {"label": "4", "a_connector": 1, "a_position": 4, "b_connector": 2, "b_position": 2},
+            {"label": "5", "a_connector": 2, "a_position": 1, "b_connector": 1, "b_position": 3},
+            {"label": "6", "a_connector": 2, "a_position": 2, "b_connector": 1, "b_position": 4},
+            {"label": "7", "a_connector": 2, "a_position": 3, "b_connector": 2, "b_position": 3},
+            {"label": "8", "a_connector": 2, "a_position": 4, "b_connector": 2, "b_position": 4},
+        ]
+        return CableType.objects.create(
+            name="Form Test 2x2 Shuffle", a_connectors=2, b_connectors=2, total_lanes=8, mapping=mapping
+        )
+
     def _minimal_form_data(self):
         """Minimal POST data sufficient to make `is_valid()` run `clean()`.
 
@@ -1217,7 +1267,7 @@ class CableFormTestCase(FormTestCases.BaseFormTestCase):
         self.assertIsNone(result["cable_type"])
         self.assertEqual(len(result["rows"]), 1)
         row = result["rows"][0]
-        self.assertEqual((row["_ac"], row["_bc"]), (1, 1))
+        self.assertEqual((row["a"]["connector"], row["b"]["connector"]), (1, 1))
         self.assertEqual(row["a_rowspan"], 1)
         self.assertEqual(row["b_rowspan"], 1)
         # Each side carries the bound termination fields for that connector.
@@ -1230,9 +1280,10 @@ class CableFormTestCase(FormTestCases.BaseFormTestCase):
         cable = Cable.objects.create(status=self.cable_status, cable_type=breakout)
         result = CableForm(instance=cable).get_connection_fields()
         self.assertIsNotNone(result["cable_type"])
-        # 1x4 → 4 lanes, each (1, bc) for bc in 1..4.
+        # 1x4 → 4 rows: A1 spans them all (only the first row carries the A cell), B1..B4 down the side.
         self.assertEqual(len(result["rows"]), 4)
-        self.assertEqual([(row["_ac"], row["_bc"]) for row in result["rows"]], [(1, 1), (1, 2), (1, 3), (1, 4)])
+        self.assertEqual(result["rows"][0]["a"]["connector"], 1)
+        self.assertEqual([row["b"]["connector"] for row in result["rows"]], [1, 2, 3, 4])
 
     def test_get_connection_fields_uses_initial_cable_type_for_breakout(self):
         """For an unsaved form whose `initial['cable_type']` is a breakout, rows come from `cable_type.mapping`."""
@@ -1274,6 +1325,96 @@ class CableFormTestCase(FormTestCases.BaseFormTestCase):
         cable = Cable.objects.create(status=self.cable_status, cable_type=multi_lane_single_connector)
         result = CableForm(instance=cable).get_connection_fields()
         self.assertIsNotNone(result["cable_type"])
-        # Only one row despite four mapping entries — the dedupe skips the (1, 1) repeats.
+        # Only one row despite four mapping entries — the layout collapses the (1, 1) repeats.
         self.assertEqual(len(result["rows"]), 1)
-        self.assertEqual((result["rows"][0]["_ac"], result["rows"][0]["_bc"]), (1, 1))
+        self.assertEqual((result["rows"][0]["a"]["connector"], result["rows"][0]["b"]["connector"]), (1, 1))
+
+    def _console_cable(self):
+        """A saved, valid cable terminating on console ports — not breakout-eligible."""
+        cp = ConsolePort.objects.create(device=self.device, name="cp-elig", type=ConsolePortTypeChoices.TYPE_RJ45)
+        csp = ConsoleServerPort.objects.create(
+            device=self.device, name="csp-elig", type=ConsolePortTypeChoices.TYPE_RJ45
+        )
+        return Cable.objects.create(termination_a=cp, termination_b=csp, status=self.cable_status)
+
+    def test_cable_type_choices_restricted_not_disabled_for_non_breakout_eligible_cable(self):
+        """A non-breakout-eligible cable still allows single-connector cable types; only multi-connector
+        types are filtered out, and the field is no longer disabled wholesale."""
+        cable = self._console_cable()
+        self.assertFalse(cable.breakout_eligible)
+        single = CableType.objects.create(name="Choices 1x1", a_connectors=1, b_connectors=1, total_lanes=1)
+        multi = CableType.objects.create(name="Choices 1x4", a_connectors=1, b_connectors=4, total_lanes=4)
+
+        field = CableForm(instance=cable).fields["cable_type"]
+        self.assertFalse(field.disabled)
+        self.assertIn(single, field.queryset)
+        self.assertNotIn(multi, field.queryset)
+
+    def test_form_rejects_multi_connector_cable_type_with_ineligible_termination(self):
+        """Selecting a multi-connector cable type for console terminations is a form error, not a 500."""
+        multi = CableType.objects.create(name="Reject form 1x2", a_connectors=1, b_connectors=2, total_lanes=2)
+        cp = ConsolePort.objects.create(device=self.device, name="cp-multi", type=ConsolePortTypeChoices.TYPE_RJ45)
+        csp = ConsoleServerPort.objects.create(
+            device=self.device, name="csp-multi", type=ConsolePortTypeChoices.TYPE_RJ45
+        )
+        data = {
+            "status": str(self.cable_status.pk),
+            "type": "",
+            "color": "",
+            "length": "",
+            "length_unit": "",
+            "label": "",
+            "cable_type": str(multi.pk),
+            "a_conn_1_type": "consoleport",
+            "a_conn_1_parent": str(self.device.pk),
+            "a_conn_1_termination": str(cp.pk),
+            "b_conn_1_type": "consoleserverport",
+            "b_conn_1_parent": str(self.device.pk),
+            "b_conn_1_termination": str(csp.pk),
+        }
+        form = CableForm(data=data)
+        self.assertFalse(form.is_valid())
+        self.assertIn("a_conn_1_termination", form.errors)
+        self.assertIn("multi-connector cable type", str(form.errors["a_conn_1_termination"]))
+
+    def test_get_connection_fields_mesh_2x2_is_structurally_valid(self):
+        """Regression: a polarity-shuffled 2x2 (mesh) renders as a valid 2-row table without crashing."""
+        shuffle = self._shuffle_cable_type()
+        cable = Cable.objects.create(status=self.cable_status, cable_type=shuffle)
+        # Construction must not raise, and the layout must collapse to two clean rows.
+        rows = CableForm(instance=cable).get_connection_fields()["rows"]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([row["a"]["connector"] for row in rows], [1, 2])
+        self.assertEqual([row["b"]["connector"] for row in rows], [1, 2])
+        # Each column's rowspans tile the two rows exactly — no overlap, no skipped-only row.
+        self.assertEqual(sum(row["a_rowspan"] for row in rows), 2)
+        self.assertEqual(sum(row["b_rowspan"] for row in rows), 2)
+
+
+class ModuleFormTestCase(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        location = Location.objects.filter(location_type=LocationType.objects.get(name="Campus")).first()
+        manufacturer = Manufacturer.objects.first() or Manufacturer.objects.create(name="Module Form Manufacturer")
+        device_type = DeviceType.objects.create(manufacturer=manufacturer, model="Module Form DeviceType")
+        device = Device.objects.create(
+            name="Module Form Device",
+            device_type=device_type,
+            role=Role.objects.get_for_model(Device).first(),
+            location=location,
+            status=Status.objects.get_for_model(Device).first(),
+        )
+        cls.module_family = ModuleFamily.objects.create(name='<script>alert("XSS")</script>')
+        cls.parent_module_bay = ModuleBay.objects.create(
+            name="Module Form Bay", position="1", parent_device=device, module_family=cls.module_family
+        )
+
+    def test_module_family_help_text_escaped(self):
+        """The parent module bay's family name is HTML-escaped before being used as form field help_text.
+
+        Regression test for GHSA-56v6-2fhr-wxgq
+        """
+        form = ModuleForm(initial={"parent_module_bay": self.parent_module_bay.pk})
+        help_text = form.fields["module_family"].help_text
+        self.assertNotIn("<script>", help_text)
+        self.assertIn("&lt;script&gt;", help_text)

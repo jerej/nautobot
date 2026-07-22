@@ -103,6 +103,7 @@ from nautobot.extras.utils import (
     RoleModelsQuery,
     TaggableClassesQuery,
 )
+from nautobot.users.api.serializers import UserSerializer
 
 from .fields import MultipleChoiceJSONField
 
@@ -165,25 +166,56 @@ class ApprovalWorkflowSerializer(NautobotModelSerializer):
         fields = "__all__"
 
 
-class ApprovalWorkflowStageSerializer(NautobotModelSerializer):
-    """ApprovalWorkflowStage Serializer."""
-
-    decision_date = serializers.DateTimeField(read_only=True, allow_null=True)
-
-    class Meta:
-        """Meta attributes."""
-
-        model = ApprovalWorkflowStage
-        fields = "__all__"
-
-
 class ApprovalWorkflowStageResponseSerializer(ValidatedModelSerializer):
-    """ApprovalWorkflowStageResponse Serializer."""
+    """Nested read representer for ApprovalWorkflowStageResponse; not exposed as its own endpoint."""
+
+    user = serializers.SerializerMethodField()
+
+    @extend_schema_field(UserSerializer)
+    def get_user(self, obj):
+        if obj.user is None:
+            return None
+        try:
+            depth = get_nested_serializer_depth(self)
+            return return_nested_serializer_data_based_on_depth(self, depth, obj, obj.user, "user")
+        except SerializerNotFound:
+            return None
 
     class Meta:
         """Meta attributes."""
 
         model = ApprovalWorkflowStageResponse
+        fields = [
+            "id",
+            "user",
+            "comments",
+            "state",
+            "last_updated",
+        ]
+        read_only_fields = ["user", "state"]
+
+
+class ApprovalWorkflowStageSerializer(NautobotModelSerializer):
+    """ApprovalWorkflowStage Serializer."""
+
+    decision_date = serializers.DateTimeField(read_only=True, allow_null=True)
+    responses = serializers.SerializerMethodField(read_only=True)
+
+    @extend_schema_field(ApprovalWorkflowStageResponseSerializer(many=True))
+    def get_responses(self, obj):
+        """Read-only nested responses, filtered by `view` permission like the UI panel."""
+        request = self.context.get("request")
+        if request is None:
+            return None
+        queryset = ApprovalWorkflowStageResponse.objects.filter(approval_workflow_stage=obj).restrict(
+            request.user, "view"
+        )
+        return ApprovalWorkflowStageResponseSerializer(queryset, many=True, context=self.context).data
+
+    class Meta:
+        """Meta attributes."""
+
+        model = ApprovalWorkflowStage
         fields = "__all__"
 
 
@@ -737,26 +769,16 @@ class JobRunResponseSerializer(serializers.Serializer):
     job_result = JobResultSerializer(read_only=True, required=False)
 
 
-class JobResultRevokePreviewSerializer(serializers.Serializer):
-    """Describes what a revoke action would do, returned by GET on the revoke endpoint."""
+class JobResultCancelPreviewSerializer(serializers.Serializer):
+    """Describes what a cancel action would do, returned by GET on the cancel endpoint."""
 
     message = serializers.CharField(help_text="Confirmation prompt to display to the user.")
-    action = serializers.ChoiceField(
-        choices=["TERMINATE", "REAP", "ABANDON", "None"],
-        help_text=(
-            "TERMINATE if worker alive; "
-            "REAP if no worker; "
-            "ABANDON if backend unreachable; "
-            "None if job already finished."
-        ),
-    )
-    action_description = serializers.CharField(help_text="Human-readable explanation of the action.")
     job_status = serializers.ChoiceField(
         choices=["RUNNING", "NOT RUNNING", "UNKNOWN", *JobResultStatusChoices.ALL_STATES],
         help_text=("For unready jobs: RUNNING, NOT RUNNING, or UNKNOWN. For ready jobs: the terminal state."),
     )
     irreversible = serializers.CharField(
-        required=False, help_text="Warning that the action cannot be undone. Omitted when action is None."
+        required=False, help_text="Warning that the action cannot be undone. Omitted when the job is already finished."
     )
     timestamp = serializers.DateTimeField(help_text="Server time when this preview was generated.")
 
