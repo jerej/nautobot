@@ -981,6 +981,26 @@ properties:
     description: >-
       The prefix used for all relationship associations in GraphQL. e.g. `my_relationship` => `rel_my_relationship`.
     type: "string"
+  GRAPHQL_SCHEMA_WARMUP:
+    default: true
+    description: >-
+      Whether to pre-build the GraphQL schema when a uWSGI worker starts, instead of building it lazily
+      when the first GraphQL request is handled.
+    details: |-
+      The GraphQL schema is generated once per worker process. By default that generation happens the
+      first time a worker handles a GraphQL request, so on large installations a single unlucky user can
+      wait many seconds for their first query. Enabling this setting moves that work to a background
+      thread at worker startup instead, so the schema is normally ready before any request arrives.
+
+      The warmup runs in a daemon thread, so the worker begins serving traffic immediately rather than
+      waiting for the schema to finish building, and a failure to pre-build the schema is logged without
+      preventing the worker from starting.
+
+      This setting only applies when running under uWSGI (`nautobot-server start`), as it is triggered
+      from a uWSGI postfork hook. It has no effect when running `nautobot-server runserver`.
+    environment_variable: "NAUTOBOT_GRAPHQL_SCHEMA_WARMUP"
+    type: "boolean"
+    version_added: "2.4.41"
   HTTP_PROXIES:
     default: null
     description: >-

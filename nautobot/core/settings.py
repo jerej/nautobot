@@ -123,6 +123,11 @@ EXEMPT_VIEW_PERMISSIONS = []
 # The file path to a directory where cloned Git repositories will be located
 GIT_ROOT = os.getenv("NAUTOBOT_GIT_ROOT", os.path.join(NAUTOBOT_ROOT, "git").rstrip("/"))
 
+# Pre-build the GraphQL schema when a uWSGI worker starts, rather than lazily on the first GraphQL
+# request. Has no effect outside uWSGI (e.g. `nautobot-server runserver`), as it is triggered from a
+# uWSGI postfork hook in `nautobot.core.wsgi`.
+GRAPHQL_SCHEMA_WARMUP = is_truthy(os.getenv("NAUTOBOT_GRAPHQL_SCHEMA_WARMUP", "True"))
+
 # HTTP proxies to use for outbound requests originating from Nautobot (e.g. when sending webhook requests)
 HTTP_PROXIES = None
 
